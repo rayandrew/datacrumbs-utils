@@ -1,0 +1,311 @@
+#! /usr/bin/env bash
+
+if [[ "${DATACRUMBS_UTILS_UTILITY_LOADED:-0}" == "1" ]]; then
+	return 0 2>/dev/null || exit 0
+fi
+readonly DATACRUMBS_UTILS_UTILITY_LOADED=1
+
+SCRIPT_DIR=@DATACRUMBS_INSTALL_BINARYDIR@
+
+datacrumbs_utils_is_sourced() {
+	[[ "${BASH_SOURCE[0]}" != "${0}" ]]
+}
+
+datacrumbs_utils_abort() {
+	local status="${1:-1}"
+	shift || true
+	if (($#)); then
+		echo "$*" >&2
+	fi
+	if datacrumbs_utils_is_sourced && [[ $- == *i* ]]; then
+		return "${status}"
+	fi
+	exit "${status}"
+}
+
+if [[ -f "${SCRIPT_DIR}/datacrumbs_logging" ]]; then
+	source "${SCRIPT_DIR}/datacrumbs_logging"
+else
+	datacrumbs_utils_abort 1 "Error: datacrumbs_logging not found in ${SCRIPT_DIR}"
+fi
+
+readonly DATACRUMBS_CLIENT_LIB="@DATACRUMBS_INSTALL_LIB_DIR@/libdatacrumbs_client.so"
+readonly DATACRUMBS_REMOTE_RUN_DIR="@DATACRUMBS_INSTALL_RUNSTATEDIR@/datacrumbs"
+readonly DATACRUMBS_REMOTE_RUN_ID_FILE="@DATACRUMBS_INSTALL_RUNSTATEDIR@/datacrumbs/datacrumbs.runid"
+readonly DATACRUMBS_REMOTE_JOB_ID_VAR="@DATACRUMBS_SCHEDULER_JOBID_ENV_VAR@"
+readonly DATACRUMBS_INSTALL_PREFIX="@DATACRUMBS_INSTALL_DIR@"
+readonly DATACRUMBS_INSTALL_SYSTEMD_DIR="@datacrumbs_INSTALL_SYSCONFDIR@/systemd"
+readonly DATACRUMBS_INSTALL_FLUX_PLUGIN_DIR="@datacrumbs_INSTALL_SYSCONFDIR@/flux/cli/plugins"
+readonly DATACRUMBS_INSTALL_SBIN_DIR="@datacrumbs_INSTALL_SBINARYDIR@"
+readonly DATACRUMBS_UTILS_INSTALL_PREFIX="@CMAKE_INSTALL_PREFIX@"
+readonly DATACRUMBS_UTILS_INSTALL_BIN_DIR="@CMAKE_INSTALL_PREFIX@/@CMAKE_INSTALL_BINDIR@"
+readonly DATACRUMBS_UTILS_INSTALL_SBIN_DIR="@CMAKE_INSTALL_PREFIX@/@CMAKE_INSTALL_SBINDIR@"
+
+datacrumbs_run_command() {
+	local err_msg="$1"
+	shift
+	if [[ "${DRY_RUN:-0}" == "1" ]]; then
+		log "[DRY RUN] Would run: $*"
+		return 0
+	fi
+	"$@" || {
+		local status=$?
+		error "${err_msg}"
+		return "${status}"
+	}
+}
+
+require_command() {
+	local command_name="$1"
+	if ! command -v "${command_name}" >/dev/null 2>&1; then
+		error "Required command not found: ${command_name}"
+		datacrumbs_utils_abort 127
+	fi
+}
+
+check_regular_user() {
+	if [[ "${DATACRUMBS_IS_ROOT:-0}" == "1" ]]; then
+		error "This script should be run as a regular user, not as root."
+		datacrumbs_utils_abort 1
+	fi
+}
+
+check_root_user() {
+	if [[ "${DATACRUMBS_IS_ROOT:-0}" != "1" ]]; then
+		error "This script must be run as root or through sudo."
+		datacrumbs_utils_abort 1
+	fi
+}
+
+default_ssh_user() {
+	echo "${DATACRUMBS_USER:-$(id -un)}"
+}
+
+resolve_run_id() {
+	local explicit_run_id="$1"
+	local env_var_name="${DATACRUMBS_REMOTE_JOB_ID_VAR}"
+	if [[ -n "${explicit_run_id}" ]]; then
+		echo "${explicit_run_id}"
+	elif [[ -n "${env_var_name}" && "${env_var_name}" != "NONE" && -n "${!env_var_name-}" ]]; then
+		echo "${!env_var_name}"
+	else
+		date +"%Y%m%d%H%M%S"
+	fi
+}
+
+expand_node_list() {
+	local node_list="$1"
+	local scheduler="${DATACRUMBS_JOB_SCHEDULER:-}"
+	if [[ -z "${node_list}" ]]; then
+		return 0
+	fi
+
+	if [[ "${node_list}" == *"["*"]"* ]]; then
+		case "${scheduler}" in
+		FLUX)
+			if command -v flux >/dev/null 2>&1; then
+				flux hostlist -e -d $'\n' "${node_list}"
+				return 0
+			fi
+			error "Flux scheduler is configured but flux is not available in PATH"
+			return 1
+			;;
+		SLURM)
+			if command -v scontrol >/dev/null 2>&1; then
+				scontrol show hostnames "${node_list}"
+				return 0
+			fi
+			error "SLURM scheduler is configured but scontrol is not available in PATH"
+			return 1
+			;;
+		esac
+	fi
+
+	printf '%s\n' "${node_list}" | tr ', ' '\n\n' | sed '/^$/d'
+}
+
+build_ssh_target() {
+	local node="$1"
+	echo "${node}"
+}
+
+format_command() {
+	local formatted=""
+	local arg
+	for arg in "$@"; do
+		if [[ -n "${formatted}" ]]; then
+			formatted+=" "
+		fi
+		printf -v formatted '%s%q' "${formatted}" "${arg}"
+	done
+	printf '%s\n' "${formatted}"
+}
+
+run_local_sudo_script() {
+	local description="$1"
+	local script_body="$2"
+	shift 2
+
+	if [[ "${DRY_RUN:-0}" == "1" ]]; then
+		local command_preview
+		if [[ "${DATACRUMBS_IS_ROOT:-0}" == "1" ]]; then
+			command_preview="$(format_command bash -s -- "$@")"
+		else
+			command_preview="$(format_command sudo bash -s -- "$@")"
+		fi
+		log "[DRY RUN] Would run locally: ${description}"
+		log "[DRY RUN] Command: ${command_preview}"
+		log "[DRY RUN] Script body:"
+		printf '%s\n' "${script_body}"
+		return 0
+	fi
+
+	if [[ "${DATACRUMBS_IS_ROOT:-0}" == "1" ]]; then
+		printf '%s\n' "${script_body}" | bash -s -- "$@"
+	else
+		printf '%s\n' "${script_body}" | sudo bash -s -- "$@"
+	fi
+}
+
+run_remote_sudo_script() {
+	local node="$1"
+	local description="$2"
+	local script_body="$3"
+	shift 3
+	local target
+	target=$(build_ssh_target "${node}")
+
+	if [[ "${DRY_RUN:-0}" == "1" ]]; then
+		local command_preview
+		command_preview="$(format_command sudo ssh "${target}" bash -s -- "$@")"
+		log "[DRY RUN] Would run on ${target}: ${description}"
+		log "[DRY RUN] Command: ${command_preview}"
+		log "[DRY RUN] Script body:"
+		printf '%s\n' "${script_body}"
+		return 0
+	fi
+
+	printf '%s\n' "${script_body}" | sudo ssh "${target}" bash -s -- "$@"
+}
+
+run_parallel_remote_sudo_script() {
+	local description="$1"
+	local script_body="$2"
+	shift 2
+	local -a shared_args=()
+	while (($#)); do
+		if [[ "$1" == "--" ]]; then
+			shift
+			break
+		fi
+		shared_args+=("$1")
+		shift
+	done
+	local -a nodes=("$@")
+	local -a pids=()
+	local -a node_names=()
+	local failed=0
+	local index=0
+
+	for node in "${nodes[@]}"; do
+		[[ -z "${node}" ]] && continue
+		run_remote_sudo_script "${node}" "${description}" "${script_body}" "${shared_args[@]}" &
+		pids+=("$!")
+		node_names+=("${node}")
+	done
+
+	for pid in "${pids[@]}"; do
+		if ! wait "${pid}"; then
+			error "Failed ${description} on node ${node_names[${index}]}"
+			failed=1
+		else
+			log "${description^} completed on node ${node_names[${index}]}"
+		fi
+		index=$((index + 1))
+	done
+
+	return "${failed}"
+}
+
+remote_write_env_and_start_service() {
+	local node="$1"
+	local run_id="$2"
+	local probe_file="$3"
+	local target
+	target=$(build_ssh_target "${node}")
+
+	if [[ "${DRY_RUN:-0}" == "1" ]]; then
+		log "[DRY RUN] Would start datacrumbs@${run_id}.service on ${target} using probe file ${probe_file}"
+		return 0
+	fi
+
+	sudo ssh "${target}" bash -s -- "${run_id}" "${probe_file}" "${DATACRUMBS_REMOTE_RUN_DIR}" <<'EOF'
+run_id="$1"
+probe_file="$2"
+run_dir="$3"
+env_file="${run_dir}/datacrumbs-${run_id}.env"
+escaped_probe_file="${probe_file//\\/\\\\}"
+escaped_probe_file="${escaped_probe_file//\"/\\\"}"
+sudo mkdir -p "${run_dir}"
+printf 'DATACRUMBS_PROBE_FILE="%s"\n' "${escaped_probe_file}" | sudo tee "${env_file}" >/dev/null
+sudo chmod 0644 "${env_file}" 2>/dev/null || true
+sudo systemctl start "datacrumbs@${run_id}.service"
+EOF
+}
+
+remote_stop_service_and_remove_env() {
+	local node="$1"
+	local run_id="$2"
+	local target
+	target=$(build_ssh_target "${node}")
+
+	if [[ "${DRY_RUN:-0}" == "1" ]]; then
+		log "[DRY RUN] Would stop datacrumbs@${run_id}.service on ${target}"
+		return 0
+	fi
+
+	sudo ssh "${target}" bash -s -- "${run_id}" "${DATACRUMBS_REMOTE_RUN_DIR}" <<'EOF'
+run_id="$1"
+run_dir="$2"
+env_file="${run_dir}/datacrumbs-${run_id}.env"
+sudo systemctl stop "datacrumbs@${run_id}.service"
+sudo rm -f "${env_file}"
+EOF
+}
+
+run_parallel_node_action() {
+	local action="$1"
+	local run_id="$2"
+	local probe_file="$3"
+	shift 3
+	local -a nodes=("$@")
+	local -a pids=()
+	local -a node_names=()
+	local failed=0
+	local index=0
+
+	for node in "${nodes[@]}"; do
+		if [[ -z "${node}" ]]; then
+			continue
+		fi
+		if [[ "${action}" == "start" ]]; then
+			remote_write_env_and_start_service "${node}" "${run_id}" "${probe_file}" &
+		else
+			remote_stop_service_and_remove_env "${node}" "${run_id}" &
+		fi
+		pids+=("$!")
+		node_names+=("${node}")
+	done
+
+	for pid in "${pids[@]}"; do
+		if ! wait "${pid}"; then
+			error "Failed ${action} on node ${node_names[${index}]}"
+			failed=1
+		else
+			log "${action^} completed on node ${node_names[${index}]}"
+		fi
+		index=$((index + 1))
+	done
+
+	return "${failed}"
+}

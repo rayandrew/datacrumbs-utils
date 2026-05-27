@@ -1,0 +1,81 @@
+#! /usr/bin/env bash
+
+SCRIPT_DIR=@DATACRUMBS_INSTALL_BINARYDIR@
+
+source "${SCRIPT_DIR}/datacrumbs_args"
+source "${SCRIPT_DIR}/datacrumbs_setup"
+
+dc_args_init "DATACRUMBS_DEPLOY_SERVICES"
+dc_args_add_option "DATACRUMBS_DEPLOY_SERVICES" "node-list" "MANDATORY" "Comma or space separated node list for datacrumbs@.service deployment" "string"
+dc_args_add_option "DATACRUMBS_DEPLOY_SERVICES" "unsetup" "OPTIONAL" "Remove deployed systemd services instead of installing them" "bool"
+dc_args_parse "DATACRUMBS_DEPLOY_SERVICES" "datacrumbs_deploy_services" "$@"
+
+check_regular_user
+require_command ssh
+
+mapfile -t DATACRUMBS_SERVICE_NODES < <(expand_node_list "${DATACRUMBS_DEPLOY_SERVICES_NODE_LIST}")
+if [[ "${#DATACRUMBS_SERVICE_NODES[@]}" -eq 0 ]]; then
+	error "No nodes resolved from node list: ${DATACRUMBS_DEPLOY_SERVICES_NODE_LIST}"
+	exit 1
+fi
+
+readonly DATACRUMBS_MANAGER_SERVICE_INSTALL_SCRIPT='
+install -d /etc/systemd/system
+ln -sfn "__INSTALL_SYSTEMD_DIR__/datacrumbs_probe_manager.service" /etc/systemd/system/datacrumbs_probe_manager.service
+systemctl daemon-reload
+systemctl enable --now datacrumbs_probe_manager.service
+'
+
+readonly DATACRUMBS_RUNTIME_SERVICE_INSTALL_SCRIPT='
+install -d /etc/systemd/system
+ln -sfn "__INSTALL_SYSTEMD_DIR__/datacrumbs@.service" /etc/systemd/system/datacrumbs@.service
+systemctl daemon-reload
+'
+
+readonly DATACRUMBS_MANAGER_SERVICE_UNINSTALL_SCRIPT='
+systemctl disable --now datacrumbs_probe_manager.service || true
+rm -f /etc/systemd/system/datacrumbs_probe_manager.service
+systemctl daemon-reload
+'
+
+readonly DATACRUMBS_RUNTIME_SERVICE_UNINSTALL_SCRIPT='
+systemctl disable datacrumbs@.service || true
+rm -f /etc/systemd/system/datacrumbs@.service
+systemctl daemon-reload
+'
+
+if [[ "${DATACRUMBS_DEPLOY_SERVICES_UNSETUP:-0}" == "1" ]]; then
+	log "Removing datacrumbs_probe_manager.service from the head node"
+	run_local_sudo_script \
+		"remove datacrumbs_probe_manager.service" \
+		"${DATACRUMBS_MANAGER_SERVICE_UNINSTALL_SCRIPT}"
+
+	log "Removing datacrumbs@.service from the head node"
+	run_local_sudo_script \
+		"remove local datacrumbs@.service" \
+		"${DATACRUMBS_RUNTIME_SERVICE_UNINSTALL_SCRIPT}"
+
+	log "Removing datacrumbs@.service from ${#DATACRUMBS_SERVICE_NODES[@]} node(s)"
+	run_parallel_remote_sudo_script \
+		"remove datacrumbs@.service" \
+		"${DATACRUMBS_RUNTIME_SERVICE_UNINSTALL_SCRIPT}" \
+		-- \
+		"${DATACRUMBS_SERVICE_NODES[@]}"
+else
+	log "Deploying datacrumbs_probe_manager.service on the head node"
+	run_local_sudo_script \
+		"deploy datacrumbs_probe_manager.service" \
+		"${DATACRUMBS_MANAGER_SERVICE_INSTALL_SCRIPT//__INSTALL_SYSTEMD_DIR__/${DATACRUMBS_INSTALL_SYSTEMD_DIR}}"
+
+	log "Deploying datacrumbs@.service on the head node"
+	run_local_sudo_script \
+		"deploy local datacrumbs@.service" \
+		"${DATACRUMBS_RUNTIME_SERVICE_INSTALL_SCRIPT//__INSTALL_SYSTEMD_DIR__/${DATACRUMBS_INSTALL_SYSTEMD_DIR}}"
+
+	log "Deploying datacrumbs@.service on ${#DATACRUMBS_SERVICE_NODES[@]} node(s)"
+	run_parallel_remote_sudo_script \
+		"deploy datacrumbs@.service" \
+		"${DATACRUMBS_RUNTIME_SERVICE_INSTALL_SCRIPT//__INSTALL_SYSTEMD_DIR__/${DATACRUMBS_INSTALL_SYSTEMD_DIR}}" \
+		-- \
+		"${DATACRUMBS_SERVICE_NODES[@]}"
+fi

@@ -1,0 +1,5 @@
+probe_attach_generic.bpf.c:72:3: error: A call to built-in function 'memcpy' is not supported.
+   72 |   __builtin_memcpy(event->arg_data[slot], &raw_value, num_bytes);
+      |   ^
+probe_attach_generic.bpf.c:72:3: error: A call to built-in function 'memcpy' is not supported.
+2 errors generated.

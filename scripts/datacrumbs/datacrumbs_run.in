@@ -1,0 +1,40 @@
+#! /usr/bin/env bash
+
+SCRIPT_DIR=@DATACRUMBS_INSTALL_BINARYDIR@
+
+source "${SCRIPT_DIR}/datacrumbs_args"
+source "${SCRIPT_DIR}/datacrumbs_setup"
+
+dc_args_init "DATACRUMBS_RUN"
+dc_args_add_option "DATACRUMBS_RUN" "node-list" "MANDATORY" "Comma or space separated node list" "string"
+dc_args_add_option "DATACRUMBS_RUN" "probe-file" "MANDATORY" "Signed probes json.gz path" "string"
+dc_args_add_option "DATACRUMBS_RUN" "run-id" "OPTIONAL" "Run id for the systemd instance" "string" ""
+dc_args_add_option "DATACRUMBS_RUN" "ssh-user" "OPTIONAL" "SSH user for remote nodes" "string" "$(default_ssh_user)"
+dc_args_parse "DATACRUMBS_RUN" "datacrumbs_run" "$@"
+
+if [[ -z "${DATACRUMBS_RUN_NODE_LIST:-}" || -z "${DATACRUMBS_RUN_PROBE_FILE:-}" ]]; then
+	dc_args_show_help "DATACRUMBS_RUN" "datacrumbs_run"
+	exit 1
+fi
+
+check_regular_user
+
+if [[ ! -f "${DATACRUMBS_RUN_PROBE_FILE}" ]]; then
+	error "Probe file not found: ${DATACRUMBS_RUN_PROBE_FILE}"
+	exit 1
+fi
+
+if [[ ! -r "${DATACRUMBS_RUN_PROBE_FILE}" ]]; then
+	error "Probe file is not readable: ${DATACRUMBS_RUN_PROBE_FILE}"
+	exit 1
+fi
+
+mapfile -t DATACRUMBS_NODES < <(expand_node_list "${DATACRUMBS_RUN_NODE_LIST}")
+if [[ "${#DATACRUMBS_NODES[@]}" -eq 0 ]]; then
+	error "No nodes resolved from node list: ${DATACRUMBS_RUN_NODE_LIST}"
+	exit 1
+fi
+
+DATACRUMBS_RESOLVED_RUN_ID=$(resolve_run_id "${DATACRUMBS_RUN_RUN_ID:-}")
+log "Starting datacrumbs@${DATACRUMBS_RESOLVED_RUN_ID}.service on ${#DATACRUMBS_NODES[@]} node(s)"
+run_parallel_node_action "start" "${DATACRUMBS_RUN_SSH_USER:-}" "${DATACRUMBS_RESOLVED_RUN_ID}" "${DATACRUMBS_RUN_PROBE_FILE}" "${DATACRUMBS_NODES[@]}"

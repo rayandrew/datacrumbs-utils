@@ -1,0 +1,6 @@
+capture_probes:
+  - name: libc
+    probe: uprobe
+    type: binary
+    file: @DATACRUMBS_LIBC_SO@
+    regex: (?!.*_)(?!.*cold)(?!.*time)(?!.*grant)(?!.*poll)(?!.*signal)(?!.*harm)(?!.*hasm).*

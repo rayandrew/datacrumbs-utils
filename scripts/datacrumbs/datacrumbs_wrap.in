@@ -1,0 +1,16 @@
+#!/bin/sh
+
+DATACRUMBS_CLIENT_LIB="@DATACRUMBS_INSTALL_LIB_DIR@/libdatacrumbs_client.so"
+
+if [ ! -f "${DATACRUMBS_CLIENT_LIB}" ]; then
+	echo "Error: datacrumbs client library not found at ${DATACRUMBS_CLIENT_LIB}" >&2
+	exit 1
+fi
+
+if [ -n "${LD_PRELOAD:-}" ]; then
+	export LD_PRELOAD="${DATACRUMBS_CLIENT_LIB}:${LD_PRELOAD}"
+else
+	export LD_PRELOAD="${DATACRUMBS_CLIENT_LIB}"
+fi
+
+exec "$@"

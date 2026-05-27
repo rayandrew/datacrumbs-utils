@@ -1,0 +1,24 @@
+capture_probes:
+  - name: sys
+    probe: syscalls
+    type: header
+    file: @DATACRUMBS_KERNEL_HEADERS_PATH@/include/linux/syscalls.h
+    regex: sys_.*
+  - name: os_page_cache
+    probe: kprobe
+    type: header
+    file: @DATACRUMBS_KERNEL_HEADERS_PATH@/include/linux/pagemap.h
+  # - name: iomap
+  #   probe: kprobe
+  #   type: ksym
+  #   regex: ^iomap(?!.*cold).*
+  # - name: xfs
+  #   probe: kprobe
+  #   type: ksym
+  #   regex: ^xfs(?!.*cold).*
+  - name: libc
+    probe: uprobe
+    type: binary
+    file: /lib64/libc.so.6
+    regex: ^(open|open64|openat|openat64|creat|creat64|close|read|write|pread|pwrite|pread64|pwrite64|readv|writev|preadv|pwritev|preadv64|pwritev64|lseek|lseek64|fsync|fdatasync|sync|mmap|mmap64|munmap|mprotect|msync|madvise|brk|sbrk|mlock|munlock|mlockall|munlockall|posix_madvise|posix_memalign|memalign|aligned_alloc|valloc|pvalloc|malloc|calloc|realloc|free|memcpy|memmove|memset|memcmp|memchr|rawmemchr|memrchr|strcpy|strncpy|strcat|strncat|strcmp|strncmp|strlen|strnlen|strchr|strrchr|strstr|strpbrk|strspn|strcspn|strdup|strndup|fopen|fopen64|freopen|freopen64|fdopen|fclose|fflush|fread|fwrite|fgetc|getc|getchar|fputc|putc|putchar|fgets|fputs|puts|ungetc|getline|getdelim|fseek|ftell|rewind|fseeko|ftello|fgetpos|fsetpos|fileno|feof|ferror|clearerr|setvbuf|setbuf|setbuffer|setlinebuf|fprintf|printf|snprintf|sprintf|vfprintf|vprintf|vsnprintf|vsprintf|scanf|fscanf|sscanf|vscanf|vfscanf|vsscanf)(@@?|$).*
+    

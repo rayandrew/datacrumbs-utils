@@ -1,0 +1,73 @@
+-- @DATACRUMBS_UTILS_MODULE_NAME@ module file
+
+whatis("Name: @DATACRUMBS_UTILS_MODULE_NAME@")
+whatis("Version:  @DATACRUMBS_UTILS_RELEASE_VERSION_STRING@")
+whatis("Category: HPC, @DATACRUMBS_UTILS_MODULE_NAME@")
+whatis("Description: @DATACRUMBS_UTILS_MODULE_NAME@")
+-- whatis("")
+
+help([[
+@DATACRUMBS_UTILS_MODULE_NAME@  @DATACRUMBS_UTILS_RELEASE_VERSION_STRING@ modulefile:
+
+- Sets environment variables for @DATACRUMBS_UTILS_MODULE_NAME@ binaries, libraries, man pages.
+
+  module load datacrumbs/@DATACRUMBS_UTILS_RELEASE_VERSION_STRING@
+]])
+
+local utils_prefix = "@CMAKE_INSTALL_PREFIX@"
+local datacrumbs_prefix = "@DATACRUMBS_INSTALL_DIR@"
+local user = os.getenv("DATACRUMBS_USER") or os.getenv("USER") or "@DATACRUMBS_INSTALL_USER@"
+
+local datacrumbs_bin_dir = "@datacrumbs_INSTALL_BINARYDIR@"
+local datacrumbs_sbin_dir = "@datacrumbs_INSTALL_SBINARYDIR@"
+local datacrumbs_lib_dir = "@datacrumbs_INSTALL_LIB_DIR@"
+local datacrumbs_etc_dir = "@datacrumbs_INSTALL_SYSCONFDIR@"
+local datacrumbs_share_dir = pathJoin(datacrumbs_prefix, "share", "datacrumbs")
+local datacrumbs_data_dir = "@datacrumbs_INSTALL_SHARED_DATA_DIR@"
+local datacrumbs_libexec_dir = pathJoin(datacrumbs_prefix, "@CMAKE_INSTALL_LIBEXECDIR@", "datacrumbs")
+local datacrumbs_user_sbin_dir = pathJoin(datacrumbs_libexec_dir, "@CMAKE_INSTALL_SBINDIR@", user)
+
+local utils_bin_dir = pathJoin(utils_prefix, "@CMAKE_INSTALL_BINDIR@")
+local utils_sbin_dir = pathJoin(utils_prefix, "@CMAKE_INSTALL_SBINDIR@")
+local utils_lib_dir = pathJoin(utils_prefix, "@CMAKE_INSTALL_LIBDIR@")
+local utils_etc_dir = pathJoin(utils_prefix, "@CMAKE_INSTALL_SYSCONFDIR@", "@PROJECT_NAME@")
+local utils_share_dir = pathJoin(utils_prefix, "share", "datacrumbs")
+local utils_data_dir = pathJoin(utils_share_dir, "data")
+local utils_libexec_dir = pathJoin(utils_prefix, "@CMAKE_INSTALL_LIBEXECDIR@", "@PROJECT_NAME@")
+local utils_user_sbin_dir = pathJoin(utils_libexec_dir, "@CMAKE_INSTALL_SBINDIR@", user)
+
+
+prepend_path("PATH", datacrumbs_bin_dir)
+prepend_path("PATH", datacrumbs_sbin_dir)
+prepend_path("PATH", datacrumbs_user_sbin_dir)
+prepend_path("PATH", utils_bin_dir)
+prepend_path("PATH", utils_sbin_dir)
+prepend_path("PATH", utils_user_sbin_dir)
+
+prepend_path("LD_LIBRARY_PATH", datacrumbs_lib_dir)
+prepend_path("LD_LIBRARY_PATH", utils_lib_dir)
+prepend_path("LD_LIBRARY_PATH", "@DEPENDENCY_LIBRARY_DIRS_COLON@")
+prepend_path("ETCPATH", datacrumbs_etc_dir)
+prepend_path("ETCPATH", utils_etc_dir)
+
+setenv("DATACRUMBS_INSTALL_DIR", datacrumbs_prefix)
+setenv("DATACRUMBS_UTILS_INSTALL_DIR", utils_prefix)
+setenv("DATACRUMBS_SHARE_DIR", datacrumbs_share_dir)
+setenv("DATACRUMBS_UTILS_SHARE_DIR", utils_share_dir)
+setenv("DATACRUMBS_DATA_DIR", datacrumbs_data_dir)
+setenv("DATACRUMBS_UTILS_DATA_DIR", utils_data_dir)
+
+-- Set additional flags
+-- local datacrumbs_flags = string.format("-L %s/lib -I %s/include ", prefix, prefix)
+
+
+-- Inform user
+if mode() == "load" then
+    LmodMessage("@DATACRUMBS_UTILS_MODULE_NAME@ loaded.")
+elseif mode() == "refresh" then
+    LmodMessage("@DATACRUMBS_UTILS_MODULE_NAME@ reloaded.")
+elseif mode() == "unload" then
+    LmodMessage("@DATACRUMBS_UTILS_MODULE_NAME@ reloaded.")
+end
+
+family("datacrumbs")

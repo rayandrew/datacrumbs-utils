@@ -1,0 +1,66 @@
+capture_probes:
+  - name: custom1
+    start_event_id: 100000
+    probe: custom
+    type: custom
+    file: @DATACRUMBS_CUSTOM_PROBE_BPF@
+    probes: @DATACRUMBS_CUSTOM_PROBE_DEFINITION@
+    process_header: @DATACRUMBS_CUSTOM_PROBE_PROCESS_HEADER@
+    event_type: 2
+  - name: sys
+    probe: syscalls
+    type: header
+    file: @DATACRUMBS_KERNEL_HEADERS_PATH@/include/linux/syscalls.h
+    regex: sys_.*
+  - name: os_page_cache
+    probe: kprobe
+    type: header
+    file: @DATACRUMBS_KERNEL_HEADERS_PATH@/include/linux/pagemap.h
+  - name: lustre
+    probe: kprobe
+    type: binary
+    file: @DATACRUMBS_LUSTRE_LUSTRE_KO@
+    regex: (?!.*__)(?!.*:)(?!.*constprop)(?!.*isra).*
+  - name: mdc
+    probe: kprobe
+    type: binary
+    file: @DATACRUMBS_LUSTRE_MDC_KO@
+    regex: (?!.*__)(?!.*:)(?!.*constprop)(?!.*isra).*
+  - name: mgc
+    probe: kprobe
+    type: binary
+    file: @DATACRUMBS_LUSTRE_MGC_KO@
+    regex: (?!.*__)(?!.*:)(?!.*constprop)(?!.*isra).*
+  - name: osc
+    probe: kprobe
+    type: binary
+    file: @DATACRUMBS_LUSTRE_OSC_KO@
+    regex: (?!.*__)(?!.*:)(?!.*constprop)(?!.*isra).*
+  - name: ptlrpc
+    probe: kprobe
+    type: binary
+    file: @DATACRUMBS_LUSTRE_PTLRPC_KO@
+    regex: (?!.*__)(?!.*:)(?!.*constprop)(?!.*isra).*
+  - name: mpi
+    probe: uprobe
+    type: binary
+    file: @DATACRUMBS_MPI_LIB@
+    regex: .*
+  - name: ior
+    probe: uprobe
+    type: binary
+    file: @DATACRUMBS_IOR_BINARY@
+    regex: .*
+  - name: iomap
+    probe: kprobe
+    type: ksym
+    regex: ^iomap(?!.*cold).*
+  - name: xfs
+    probe: kprobe
+    type: ksym
+    regex: ^xfs(?!.*cold).*
+  - name: libc
+    probe: uprobe
+    type: binary
+    file: @DATACRUMBS_LIBC_SO@
+    regex: .*

@@ -1,0 +1,36 @@
+#!/bin/sh
+
+set -eu
+
+client_lib="@DATACRUMBS_INSTALL_LIB_DIR@/libdatacrumbs_client.so"
+wrap_cmd="@DATACRUMBS_INSTALL_BINARYDIR@/datacrumbs_wrap"
+tmp_dir="@CMAKE_CURRENT_BINARY_DIR@/tests/dd-preload"
+out_file="${tmp_dir}/dd.out"
+
+if [ ! -f "${client_lib}" ]; then
+	echo "Skipping dd preload test: installed client library not found at ${client_lib}"
+	exit 77
+fi
+
+mkdir -p "${tmp_dir}"
+rm -f "${out_file}"
+
+if [ -x "${wrap_cmd}" ]; then
+	"${wrap_cmd}" dd if=/dev/zero of="${out_file}" bs=4096 count=1 status=none
+else
+	echo "Build datacrumbs_wrap not found at ${wrap_cmd}, falling back to direct LD_PRELOAD"
+	LD_PRELOAD="${client_lib}" dd if=/dev/zero of="${out_file}" bs=4096 count=1 status=none
+fi
+
+if [ ! -f "${out_file}" ]; then
+	echo "dd preload test failed: output file was not created"
+	exit 1
+fi
+
+file_size="$(wc -c <"${out_file}")"
+if [ "${file_size}" != "4096" ]; then
+	echo "dd preload test failed: expected 4096 bytes, got ${file_size}"
+	exit 1
+fi
+
+rm -f "${out_file}"

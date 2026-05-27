@@ -1,0 +1,50 @@
+#! /usr/bin/env bash
+
+SCRIPT_DIR="@DATACRUMBS_INSTALL_BINARYDIR@"
+
+if [[ -f "$SCRIPT_DIR/datacrumbs_args" ]]; then
+	source "$SCRIPT_DIR/datacrumbs_args"
+else
+	echo "Error: datacrumbs_args not found in $SCRIPT_DIR" >&2
+	exit 1
+fi
+
+APP="DC_PROBE_CONFIGURATOR"
+dc_args_init "$APP"
+dc_args_add_positional "$APP" "config-file" "MANDATORY" "Path to the probe configuration YAML file"
+dc_args_add_positional "$APP" "output-file" "MANDATORY" "Path to write the signed compressed probes JSON"
+dc_args_parse "$APP" "datacrumbs_probe_configurator" "$@"
+
+config_file="${DC_PROBE_CONFIGURATOR_CONFIG_FILE}"
+if [[ ! -f "${config_file}" ]]; then
+	echo "Error: config file not found: ${config_file}" >&2
+	exit 1
+fi
+
+output_path="${DC_PROBE_CONFIGURATOR_OUTPUT_FILE}"
+output_dir="$(dirname "${output_path}")"
+
+export DATACRUMBS_USER="${DATACRUMBS_USER:-$(id -un)}"
+source "${SCRIPT_DIR}/datacrumbs_setup"
+
+mkdir -p "${output_dir}"
+output_dir="$(cd "${output_dir}" && pwd)"
+output_path="${output_dir}/$(basename "${output_path}")"
+export LD_LIBRARY_PATH="${DATACRUMBS_UTILS_INSTALL_LIB_DIR}:${DATACRUMBS_INSTALL_LIB_DIR}:@DEPENDENCY_LIBRARY_DIRS_COLON@:${LD_LIBRARY_PATH:-}"
+
+cmd=(
+	"@CMAKE_INSTALL_PREFIX@/@CMAKE_INSTALL_BINDIR@/datacrumbs_probe_configurator_exec"
+	"${config_file}"
+	"--data_dir" "${output_dir}"
+	"--probe_file_path" "${output_path}"
+	"--user" "${DATACRUMBS_USER}"
+)
+
+if [[ "${DRY_RUN:-0}" == "1" ]]; then
+	printf "[DRY RUN]"
+	printf " %q" "${cmd[@]}"
+	printf "\n"
+	exit 0
+fi
+
+exec "${cmd[@]}"

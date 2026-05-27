@@ -1,0 +1,106 @@
+#! /usr/bin/env bash
+
+SCRIPT_DIR=@DATACRUMBS_INSTALL_BINARYDIR@
+
+source "${SCRIPT_DIR}/datacrumbs_args"
+source "${SCRIPT_DIR}/datacrumbs_setup"
+
+dc_args_init "DATACRUMBS_INSTALL_FLUX_PLUGIN"
+dc_args_add_option "DATACRUMBS_INSTALL_FLUX_PLUGIN" "plugin-dir" "OPTIONAL" "Flux CLI plugin directory override" "string" ""
+dc_args_add_option "DATACRUMBS_INSTALL_FLUX_PLUGIN" "unsetup" "OPTIONAL" "Remove the installed Flux CLI plugin instead of installing it" "bool"
+dc_args_parse "DATACRUMBS_INSTALL_FLUX_PLUGIN" "datacrumbs_install_flux_plugin" "$@"
+
+check_regular_user
+
+detect_flux_plugin_dir() {
+	if [[ -n "${DATACRUMBS_INSTALL_FLUX_PLUGIN_PLUGIN_DIR:-}" ]]; then
+		echo "${DATACRUMBS_INSTALL_FLUX_PLUGIN_PLUGIN_DIR}"
+		return 0
+	fi
+
+	if [[ -d "/etc/flux/cli" || ! -e "/etc/flux/cli/plugins" ]]; then
+		echo "/etc/flux/cli/plugins"
+		return 0
+	fi
+
+	if ! command -v python3 >/dev/null 2>&1; then
+		return 1
+	fi
+
+	python3 - <<'PY'
+import inspect
+from pathlib import Path
+
+try:
+    import flux.cli.plugin
+except Exception:
+    raise SystemExit(1)
+
+plugin_dir = Path(inspect.getfile(flux.cli.plugin)).resolve().parent / "plugins"
+print(plugin_dir)
+PY
+}
+
+DATACRUMBS_FLUX_PLUGIN_DIR="$(detect_flux_plugin_dir)" || {
+	error "Unable to determine Flux CLI plugin directory. Re-run with --plugin-dir."
+	exit 1
+}
+
+DATACRUMBS_FLUX_PLUGIN_TARGET="${DATACRUMBS_FLUX_PLUGIN_DIR}/datacrumbs.py"
+DATACRUMBS_FLUX_PLUGIN_SOURCE="${DATACRUMBS_INSTALL_FLUX_PLUGIN_DIR}/datacrumbs.py"
+
+readonly DATACRUMBS_FLUX_PLUGIN_INSTALL_SCRIPT='
+plugin_dir="$1"
+install_plugin="$2"
+install -d "${plugin_dir}"
+cp -f "${install_plugin}" "${plugin_dir}/datacrumbs.py"
+chown flux "${plugin_dir}/datacrumbs.py"
+chmod go+r "${plugin_dir}/datacrumbs.py"
+'
+
+readonly DATACRUMBS_FLUX_PLUGIN_UNINSTALL_SCRIPT='
+plugin_dir="$1"
+rm -f "${plugin_dir}/datacrumbs.py"
+'
+
+reload_flux_config() {
+	if [[ "${DRY_RUN:-0}" == "1" ]]; then
+		log "[DRY RUN] Would run: flux config reload"
+		return 0
+	fi
+
+	if ! command -v flux >/dev/null 2>&1; then
+		warn "Flux CLI not found on the head node; skipping flux config reload"
+		return 0
+	fi
+
+	run_local_sudo_script \
+		"reload Flux configuration" \
+		$'flux config reload'
+}
+
+if [[ "${DATACRUMBS_INSTALL_FLUX_PLUGIN_UNSETUP:-0}" == "1" ]]; then
+	log "Removing Flux CLI plugin from ${DATACRUMBS_FLUX_PLUGIN_DIR}"
+	if [[ "${DRY_RUN:-0}" == "1" ]]; then
+		log "[DRY RUN] Would remove ${DATACRUMBS_FLUX_PLUGIN_TARGET}"
+	fi
+	run_local_sudo_script \
+		"remove Flux CLI plugin" \
+		"${DATACRUMBS_FLUX_PLUGIN_UNINSTALL_SCRIPT}" \
+		"${DATACRUMBS_FLUX_PLUGIN_DIR}"
+	reload_flux_config
+else
+	log "Installing Flux CLI plugin into ${DATACRUMBS_FLUX_PLUGIN_DIR}"
+	if [[ "${DRY_RUN:-0}" == "1" ]]; then
+		log "[DRY RUN] Would create directory ${DATACRUMBS_FLUX_PLUGIN_DIR}"
+		log "[DRY RUN] Would copy ${DATACRUMBS_FLUX_PLUGIN_SOURCE} to ${DATACRUMBS_FLUX_PLUGIN_TARGET}"
+		log "[DRY RUN] Would set ownership on ${DATACRUMBS_FLUX_PLUGIN_TARGET} to flux"
+		log "[DRY RUN] Would run chmod go+r on ${DATACRUMBS_FLUX_PLUGIN_TARGET}"
+	fi
+	run_local_sudo_script \
+		"install Flux CLI plugin" \
+		"${DATACRUMBS_FLUX_PLUGIN_INSTALL_SCRIPT}" \
+		"${DATACRUMBS_FLUX_PLUGIN_DIR}" \
+		"${DATACRUMBS_FLUX_PLUGIN_SOURCE}"
+	reload_flux_config
+fi

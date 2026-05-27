@@ -1,0 +1,9 @@
+capture_probes:
+  - name: custom1
+    start_event_id: 100000
+    probe: custom
+    type: custom
+    file: @DATACRUMBS_CUSTOM_PROBE_BPF@
+    probes: @DATACRUMBS_CUSTOM_PROBE_DEFINITION@
+    process_header: @DATACRUMBS_CUSTOM_PROBE_PROCESS_HEADER@
+    event_type: 2

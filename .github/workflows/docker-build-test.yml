@@ -1,0 +1,59 @@
+name: Docker Build and Test
+
+on:
+  push:
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  DOCKER_IMAGE_NAME: datacrumbs
+  DOCKER_TAG: latest
+
+jobs:
+  docker-build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout datacrumbs-utils
+        uses: actions/checkout@v4
+        with:
+          path: datacrumbs-utils
+
+      - name: Checkout datacrumbs
+        uses: actions/checkout@v4
+        with:
+          repository: llnl/datacrumbs
+          ref: main
+          fetch-depth: 1
+          path: datacrumbs
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        run: |
+          rm -rf "${GITHUB_WORKSPACE}/docker-context"
+          mkdir -p "${GITHUB_WORKSPACE}/docker-context"
+          cp -a "${GITHUB_WORKSPACE}/datacrumbs/." "${GITHUB_WORKSPACE}/docker-context/"
+          mkdir -p "${GITHUB_WORKSPACE}/docker-context/infrastructure/docker"
+          cp "${GITHUB_WORKSPACE}/datacrumbs-utils/infrastructure/docker/test_run.sh" \
+             "${GITHUB_WORKSPACE}/docker-context/infrastructure/docker/test_run.sh"
+          bash "${GITHUB_WORKSPACE}/datacrumbs-utils/scripts/docker-build.sh" \
+                  --repo-root "${GITHUB_WORKSPACE}/docker-context" \
+                  --version ${{ env.DOCKER_TAG }}
+
+      - name: Run utilities smoke test
+        run: |
+          docker run --rm \
+                -v /lib/modules/:/lib/modules:ro \
+                -v /sys/kernel/debug/:/sys/kernel/debug:rw \
+                --net=host \
+                --pid=host \
+                --privileged \
+                --cap-add sys_admin \
+                --cap-add sys_ptrace \
+                --hostname docker \
+                -v /sys/fs/bpf:/sys/fs/bpf \
+                ${{ env.DOCKER_IMAGE_NAME }}:${{ env.DOCKER_TAG }} \
+                bash -lc 'bash /opt/datacrumbs/infrastructure/docker/test_run.sh'

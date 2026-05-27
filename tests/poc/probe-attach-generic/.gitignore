@@ -1,0 +1,4 @@
+probe_attach_generic
+probe_attach_generic.bpf.o
+probe_attach_generic.skel.h
+vmlinux.h

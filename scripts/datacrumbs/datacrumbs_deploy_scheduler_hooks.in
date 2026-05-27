@@ -1,0 +1,96 @@
+#! /usr/bin/env bash
+
+SCRIPT_DIR=@DATACRUMBS_INSTALL_BINARYDIR@
+DEFAULT_SCHEDULER=@DATACRUMBS_SCHEDULER_TYPE@
+
+source "${SCRIPT_DIR}/datacrumbs_args"
+source "${SCRIPT_DIR}/datacrumbs_setup"
+
+dc_args_init "DATACRUMBS_DEPLOY_HOOKS"
+dc_args_add_option "DATACRUMBS_DEPLOY_HOOKS" "node-list" "MANDATORY" "Comma or space separated node list for scheduler hook deployment" "string"
+dc_args_add_option "DATACRUMBS_DEPLOY_HOOKS" "scheduler" "OPTIONAL" "Scheduler type (FLUX or SLURM)" "string" "${DEFAULT_SCHEDULER}"
+dc_args_add_option "DATACRUMBS_DEPLOY_HOOKS" "prolog-dir" "OPTIONAL" "Scheduler prolog directory override" "string" ""
+dc_args_add_option "DATACRUMBS_DEPLOY_HOOKS" "epilog-dir" "OPTIONAL" "Scheduler epilog directory override" "string" ""
+dc_args_add_option "DATACRUMBS_DEPLOY_HOOKS" "unsetup" "OPTIONAL" "Remove deployed scheduler hooks instead of installing them" "bool"
+dc_args_parse "DATACRUMBS_DEPLOY_HOOKS" "datacrumbs_deploy_scheduler_hooks" "$@"
+
+check_regular_user
+require_command ssh
+
+mapfile -t DATACRUMBS_HOOK_NODES < <(expand_node_list "${DATACRUMBS_DEPLOY_HOOKS_NODE_LIST}")
+if [[ "${#DATACRUMBS_HOOK_NODES[@]}" -eq 0 ]]; then
+	error "No nodes resolved from node list: ${DATACRUMBS_DEPLOY_HOOKS_NODE_LIST}"
+	exit 1
+fi
+
+DATACRUMBS_SELECTED_SCHEDULER="$(echo "${DATACRUMBS_DEPLOY_HOOKS_SCHEDULER:-${DEFAULT_SCHEDULER}}" | dc__upper)"
+case "${DATACRUMBS_SELECTED_SCHEDULER}" in
+FLUX)
+	DATACRUMBS_PROLOG_DIR="${DATACRUMBS_DEPLOY_HOOKS_PROLOG_DIR:-/etc/flux/system/prolog-job-manager.d}"
+	DATACRUMBS_EPILOG_DIR="${DATACRUMBS_DEPLOY_HOOKS_EPILOG_DIR:-/etc/flux/system/epilog.d}"
+	;;
+SLURM)
+	DATACRUMBS_PROLOG_DIR="${DATACRUMBS_DEPLOY_HOOKS_PROLOG_DIR:-/etc/slurm/prolog.d}"
+	DATACRUMBS_EPILOG_DIR="${DATACRUMBS_DEPLOY_HOOKS_EPILOG_DIR:-/etc/slurm/epilog.d}"
+	;;
+*)
+	error "Unsupported scheduler: ${DATACRUMBS_SELECTED_SCHEDULER}. Expected FLUX or SLURM."
+	exit 1
+	;;
+esac
+
+readonly DATACRUMBS_SCHEDULER_HOOK_INSTALL_SCRIPT='
+prolog_dir="$1"
+epilog_dir="$2"
+install_sbin_dir="$3"
+install -d "${prolog_dir}" "${epilog_dir}"
+ln -sfn "${install_sbin_dir}/datacrumbs_service_run.sh" "${prolog_dir}/datacrumbs_service_run.sh"
+ln -sfn "${install_sbin_dir}/datacrumbs_service_stop.sh" "${epilog_dir}/datacrumbs_service_stop.sh"
+chmod 0755 "${install_sbin_dir}/datacrumbs_service_run.sh" "${install_sbin_dir}/datacrumbs_service_stop.sh"
+'
+
+readonly DATACRUMBS_SCHEDULER_HOOK_UNINSTALL_SCRIPT='
+prolog_dir="$1"
+epilog_dir="$2"
+rm -f "${prolog_dir}/datacrumbs_service_run.sh" "${epilog_dir}/datacrumbs_service_stop.sh"
+'
+
+if [[ "${DATACRUMBS_DEPLOY_HOOKS_UNSETUP:-0}" == "1" ]]; then
+	log "Removing ${DATACRUMBS_SELECTED_SCHEDULER} scheduler hooks on ${#DATACRUMBS_HOOK_NODES[@]} node(s)"
+	run_parallel_remote_sudo_script \
+		"remove ${DATACRUMBS_SELECTED_SCHEDULER} scheduler hooks" \
+		"${DATACRUMBS_SCHEDULER_HOOK_UNINSTALL_SCRIPT}" \
+		"${DATACRUMBS_PROLOG_DIR}" \
+		"${DATACRUMBS_EPILOG_DIR}" \
+		-- \
+		"${DATACRUMBS_HOOK_NODES[@]}"
+else
+	log "Deploying ${DATACRUMBS_SELECTED_SCHEDULER} scheduler hooks on ${#DATACRUMBS_HOOK_NODES[@]} node(s)"
+	run_parallel_remote_sudo_script \
+		"deploy ${DATACRUMBS_SELECTED_SCHEDULER} scheduler hooks" \
+		"${DATACRUMBS_SCHEDULER_HOOK_INSTALL_SCRIPT}" \
+		"${DATACRUMBS_PROLOG_DIR}" \
+		"${DATACRUMBS_EPILOG_DIR}" \
+		"${DATACRUMBS_INSTALL_SBIN_DIR}" \
+		-- \
+		"${DATACRUMBS_HOOK_NODES[@]}"
+fi
+
+if [[ "${DRY_RUN:-0}" != "1" ]]; then
+	case "${DATACRUMBS_SELECTED_SCHEDULER}" in
+	FLUX)
+		if command -v flux >/dev/null 2>&1; then
+			run_local_sudo_script "reload Flux configuration" $'set -eo pipefail\nflux config reload'
+		else
+			warn "Flux CLI not found on the head node; skipping flux config reload"
+		fi
+		;;
+	SLURM)
+		if command -v scontrol >/dev/null 2>&1; then
+			run_local_sudo_script "reconfigure SLURM" $'set -eo pipefail\nscontrol reconfigure'
+		else
+			warn "scontrol not found on the head node; skipping slurm reconfigure"
+		fi
+		;;
+	esac
+fi

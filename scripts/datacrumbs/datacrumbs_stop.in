@@ -1,0 +1,28 @@
+#! /usr/bin/env bash
+
+SCRIPT_DIR=@DATACRUMBS_INSTALL_BINARYDIR@
+
+source "${SCRIPT_DIR}/datacrumbs_args"
+source "${SCRIPT_DIR}/datacrumbs_setup"
+
+dc_args_init "DATACRUMBS_STOP"
+dc_args_add_option "DATACRUMBS_STOP" "node-list" "MANDATORY" "Comma or space separated node list" "string"
+dc_args_add_option "DATACRUMBS_STOP" "run-id" "MANDATORY" "Run id for the systemd instance" "string"
+dc_args_add_option "DATACRUMBS_STOP" "ssh-user" "OPTIONAL" "SSH user for remote nodes" "string" "$(default_ssh_user)"
+dc_args_parse "DATACRUMBS_STOP" "datacrumbs_stop" "$@"
+
+if [[ -z "${DATACRUMBS_STOP_NODE_LIST:-}" || -z "${DATACRUMBS_STOP_RUN_ID:-}" ]]; then
+	dc_args_show_help "DATACRUMBS_STOP" "datacrumbs_stop"
+	exit 1
+fi
+
+check_regular_user
+
+mapfile -t DATACRUMBS_NODES < <(expand_node_list "${DATACRUMBS_STOP_NODE_LIST}")
+if [[ "${#DATACRUMBS_NODES[@]}" -eq 0 ]]; then
+	error "No nodes resolved from node list: ${DATACRUMBS_STOP_NODE_LIST}"
+	exit 1
+fi
+
+log "Stopping datacrumbs@${DATACRUMBS_STOP_RUN_ID}.service on ${#DATACRUMBS_NODES[@]} node(s)"
+run_parallel_node_action "stop" "${DATACRUMBS_STOP_SSH_USER:-}" "${DATACRUMBS_STOP_RUN_ID}" "" "${DATACRUMBS_NODES[@]}"

@@ -1,0 +1,16 @@
+capture_probes:
+  - name: mpi-api
+    probe: uprobe
+    type: binary
+    file: @DATACRUMBS_MPI_LIB@
+    regex: PMPI.*
+  - name: mpii
+    probe: uprobe
+    type: binary
+    file: @DATACRUMBS_MPI_LIB@
+    regex: MPII.*
+  - name: mpi-rest
+    probe: uprobe
+    type: binary
+    file: @DATACRUMBS_MPI_LIB@
+    regex: .*

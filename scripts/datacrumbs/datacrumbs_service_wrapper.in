@@ -1,0 +1,137 @@
+#! /usr/bin/env bash
+
+SCRIPT_DIR=@DATACRUMBS_INSTALL_BINARYDIR@
+SERVICE_COMMON_INSTALL=@datacrumbs_INSTALL_SBINARYDIR@/datacrumbs_service_common.sh
+SERVICE_SCHEDULER_TYPE=@DATACRUMBS_SCHEDULER_TYPE@
+
+source "${SCRIPT_DIR}/datacrumbs_logging"
+
+usage() {
+	echo "Usage: datacrumbs_service_wrapper <start|stop> <job-id> <user> <probe-file>"
+	echo "  start: datacrumbs_service_wrapper start <job-id> <user> <probe-file>"
+	echo "  stop:  datacrumbs_service_wrapper stop <job-id> <user> <probe-file>"
+}
+
+if [[ $# -ne 4 ]]; then
+	usage
+	exit 1
+fi
+
+ACTION="$1"
+JOB_ID="$2"
+SUBMIT_USER="$3"
+PROBE_FILE="$4"
+
+if [[ "${ACTION}" != "start" && "${ACTION}" != "stop" ]]; then
+	error "action must be 'start' or 'stop'"
+	exit 1
+fi
+
+if [[ -z "${JOB_ID}" ]]; then
+	error "job-id is required"
+	exit 1
+fi
+
+if [[ ! -f "${PROBE_FILE}" ]]; then
+	error "Probe file not found: ${PROBE_FILE}"
+	exit 1
+fi
+
+PROBE_FILE="$(realpath "${PROBE_FILE}")"
+
+WRAPPER_TMPDIR="$(mktemp -d)"
+cleanup_wrapper_tmpdir() {
+	rm -rf "${WRAPPER_TMPDIR}"
+}
+trap cleanup_wrapper_tmpdir EXIT
+
+install_flux_shim() {
+	cat >"${WRAPPER_TMPDIR}/flux" <<EOF
+#!/usr/bin/env bash
+if [[ "\$1" == "job" && "\$2" == "info" && "\$3" == "${JOB_ID}" && "\$4" == "jobspec" ]]; then
+	jq -n -c \
+		--arg enable "yes" \
+		--arg probe_file "${PROBE_FILE}" \
+		'{attributes:{system:{datacrumbs:{enable:\$enable, probe_file:\$probe_file}}}}'
+	exit 0
+fi
+if [[ "\$1" == "job" && "\$2" == "raise" ]]; then
+	exit 0
+fi
+exit 1
+EOF
+	chmod +x "${WRAPPER_TMPDIR}/flux"
+}
+
+install_slurm_shim() {
+	cat >"${WRAPPER_TMPDIR}/scontrol" <<EOF
+#!/usr/bin/env bash
+if [[ "\$1" == "show" && "\$2" == "job" && "\$3" == "${JOB_ID}" ]]; then
+	comment_json=\$(jq -n -c \
+		--arg enable "yes" \
+		--arg probe_file "${PROBE_FILE}" \
+		'{datacrumbs:{enable:\$enable, probe_file:\$probe_file}}')
+	printf 'Comment=%s\n' "\${comment_json}"
+	exit 0
+fi
+exit 1
+EOF
+	chmod +x "${WRAPPER_TMPDIR}/scontrol"
+}
+
+case "${SERVICE_SCHEDULER_TYPE}" in
+FLUX)
+	install_flux_shim
+	export FLUX_JOB_ID="${JOB_ID}"
+	if [[ -n "${SUBMIT_USER}" ]]; then
+		export FLUX_JOB_USER="${SUBMIT_USER}"
+	fi
+	;;
+SLURM)
+	install_slurm_shim
+	export SLURM_JOB_ID="${JOB_ID}"
+	if [[ -n "${SUBMIT_USER}" ]]; then
+		export SLURM_JOB_USER="${SUBMIT_USER}"
+	fi
+	;;
+*)
+	error "Unsupported scheduler type for service wrapper: ${SERVICE_SCHEDULER_TYPE}"
+	exit 1
+	;;
+esac
+
+export PATH="${WRAPPER_TMPDIR}:${PATH}"
+
+if [[ "${ACTION}" == "start" ]]; then
+	export DATACRUMBS_SERVICE_PHASE_OVERRIDE="prolog"
+else
+	export DATACRUMBS_SERVICE_PHASE_OVERRIDE="epilog"
+fi
+
+if [[ "${DRY_RUN:-0}" == "1" ]]; then
+	log "Scheduler type: ${SERVICE_SCHEDULER_TYPE}"
+	log "Job id: ${JOB_ID}"
+	log "Submitting user: ${SUBMIT_USER}"
+	log "Probe file: ${PROBE_FILE}"
+fi
+
+if [[ -f "${SERVICE_COMMON_INSTALL}" ]]; then
+	SERVICE_COMMON_SCRIPT="${SERVICE_COMMON_INSTALL}"
+else
+	error "Unable to find datacrumbs_service_common.sh in ${SERVICE_COMMON_INSTALL}"
+	exit 1
+fi
+
+if source "${SERVICE_COMMON_SCRIPT}"; then
+	if [[ "${ACTION}" == "start" ]]; then
+		umask 022
+		write_service_env_file "${DATACRUMBS_SERVICE_ENV_FILE}" "${DATACRUMBS_PROBE_FILE}"
+		log_system "Starting datacrumbs@${DATACRUMBS_SERVICE_RUN_ID}.service with ${DATACRUMBS_PROBE_FILE}"
+		systemctl_cmd start "datacrumbs@${DATACRUMBS_SERVICE_RUN_ID}.service"
+	else
+		log_system "Stopping datacrumbs@${DATACRUMBS_SERVICE_RUN_ID}.service"
+		systemctl_cmd stop "datacrumbs@${DATACRUMBS_SERVICE_RUN_ID}.service"
+		wait_for_unit_inactive "datacrumbs@${DATACRUMBS_SERVICE_RUN_ID}.service"
+		remove_service_env_file "${DATACRUMBS_SERVICE_ENV_FILE}"
+	fi
+fi

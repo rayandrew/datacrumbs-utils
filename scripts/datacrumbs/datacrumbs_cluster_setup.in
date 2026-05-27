@@ -1,0 +1,123 @@
+#! /usr/bin/env bash
+
+SCRIPT_DIR=@DATACRUMBS_INSTALL_BINARYDIR@
+DEFAULT_SCHEDULER=@DATACRUMBS_SCHEDULER_TYPE@
+
+source "${SCRIPT_DIR}/datacrumbs_args"
+source "${SCRIPT_DIR}/datacrumbs_setup"
+
+dc_args_init "DATACRUMBS_CLUSTER_SETUP"
+dc_args_add_option "DATACRUMBS_CLUSTER_SETUP" "stage" "MANDATORY" "Setup stage: services, scheduler-hooks, flux-plugin, or all" "string"
+dc_args_add_option "DATACRUMBS_CLUSTER_SETUP" "node-list" "OPTIONAL" "Comma or space separated node list for node-wide stages" "string" ""
+dc_args_add_option "DATACRUMBS_CLUSTER_SETUP" "scheduler" "OPTIONAL" "Scheduler type (FLUX or SLURM)" "string" "${DEFAULT_SCHEDULER}"
+dc_args_add_option "DATACRUMBS_CLUSTER_SETUP" "prolog-dir" "OPTIONAL" "Scheduler prolog directory override" "string" ""
+dc_args_add_option "DATACRUMBS_CLUSTER_SETUP" "epilog-dir" "OPTIONAL" "Scheduler epilog directory override" "string" ""
+dc_args_add_option "DATACRUMBS_CLUSTER_SETUP" "plugin-dir" "OPTIONAL" "Flux CLI plugin directory override" "string" ""
+dc_args_add_option "DATACRUMBS_CLUSTER_SETUP" "unsetup" "OPTIONAL" "Remove deployed datacrumbs services, hooks, and plugins instead of installing them" "bool"
+dc_args_parse "DATACRUMBS_CLUSTER_SETUP" "datacrumbs_cluster_setup" "$@"
+
+check_regular_user
+
+DATACRUMBS_CLUSTER_STAGE="$(echo "${DATACRUMBS_CLUSTER_SETUP_STAGE}" | dc__lower)"
+DATACRUMBS_CLUSTER_SCHEDULER="$(echo "${DATACRUMBS_CLUSTER_SETUP_SCHEDULER:-${DEFAULT_SCHEDULER}}" | dc__upper)"
+
+append_common_flags() {
+	local -n argv_ref="$1"
+	if [[ "${DATACRUMBS_CLUSTER_SETUP_UNSETUP:-0}" == "1" ]]; then
+		argv_ref+=("--unsetup")
+	fi
+	if [[ "${VERBOSE:-0}" == "1" ]]; then
+		argv_ref+=("--verbose")
+	fi
+	if [[ "${QUIET:-0}" == "1" ]]; then
+		argv_ref+=("--quiet")
+	fi
+	if [[ "${DRY_RUN:-0}" == "1" ]]; then
+		argv_ref+=("--dry-run")
+	fi
+}
+
+run_stage_command() {
+	local err_msg="$1"
+	shift
+	if [[ "${DRY_RUN:-0}" == "1" ]]; then
+		"$@"
+	else
+		datacrumbs_run_command "${err_msg}" "$@"
+	fi
+}
+
+run_services_stage() {
+	if [[ -z "${DATACRUMBS_CLUSTER_SETUP_NODE_LIST:-}" ]]; then
+		error "--node-list is required for the services stage"
+		exit 1
+	fi
+	local -a cmd=("${SCRIPT_DIR}/datacrumbs_deploy_services" "--node-list" "${DATACRUMBS_CLUSTER_SETUP_NODE_LIST}")
+	append_common_flags cmd
+	log "Running services stage"
+	run_stage_command "Failed to deploy services" "${cmd[@]}"
+}
+
+run_scheduler_hooks_stage() {
+	if [[ -z "${DATACRUMBS_CLUSTER_SETUP_NODE_LIST:-}" ]]; then
+		error "--node-list is required for the scheduler-hooks stage"
+		exit 1
+	fi
+	local -a cmd=("${SCRIPT_DIR}/datacrumbs_deploy_scheduler_hooks"
+		"--node-list" "${DATACRUMBS_CLUSTER_SETUP_NODE_LIST}"
+		"--scheduler" "${DATACRUMBS_CLUSTER_SCHEDULER}")
+	if [[ -n "${DATACRUMBS_CLUSTER_SETUP_PROLOG_DIR:-}" ]]; then
+		cmd+=("--prolog-dir" "${DATACRUMBS_CLUSTER_SETUP_PROLOG_DIR}")
+	fi
+	if [[ -n "${DATACRUMBS_CLUSTER_SETUP_EPILOG_DIR:-}" ]]; then
+		cmd+=("--epilog-dir" "${DATACRUMBS_CLUSTER_SETUP_EPILOG_DIR}")
+	fi
+	append_common_flags cmd
+	log "Running scheduler-hooks stage"
+	run_stage_command "Failed to deploy scheduler hooks" "${cmd[@]}"
+}
+
+run_flux_plugin_stage() {
+	local -a cmd=("${SCRIPT_DIR}/datacrumbs_install_flux_plugin")
+	if [[ -n "${DATACRUMBS_CLUSTER_SETUP_PLUGIN_DIR:-}" ]]; then
+		cmd+=("--plugin-dir" "${DATACRUMBS_CLUSTER_SETUP_PLUGIN_DIR}")
+	fi
+	append_common_flags cmd
+	log "Running flux-plugin stage"
+	run_stage_command "Failed to install Flux plugin" "${cmd[@]}"
+}
+
+case "${DATACRUMBS_CLUSTER_STAGE}" in
+services)
+	run_services_stage
+	;;
+scheduler-hooks)
+	run_scheduler_hooks_stage
+	;;
+flux-plugin)
+	run_flux_plugin_stage
+	;;
+all)
+	if [[ "${DATACRUMBS_CLUSTER_SETUP_UNSETUP:-0}" == "1" ]]; then
+		if [[ "${DATACRUMBS_CLUSTER_SCHEDULER}" == "FLUX" ]]; then
+			run_flux_plugin_stage
+		else
+			log "Skipping Flux plugin stage for scheduler ${DATACRUMBS_CLUSTER_SCHEDULER}"
+		fi
+		run_scheduler_hooks_stage
+		run_services_stage
+	else
+		run_services_stage
+		run_scheduler_hooks_stage
+		if [[ "${DATACRUMBS_CLUSTER_SCHEDULER}" == "FLUX" ]]; then
+			run_flux_plugin_stage
+		else
+			log "Skipping Flux plugin stage for scheduler ${DATACRUMBS_CLUSTER_SCHEDULER}"
+		fi
+	fi
+	;;
+*)
+	error "Unsupported stage: ${DATACRUMBS_CLUSTER_SETUP_STAGE}. Expected services, scheduler-hooks, flux-plugin, or all."
+	exit 1
+	;;
+esac

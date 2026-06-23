@@ -385,6 +385,31 @@ ConfigurationManager::ConfigurationManager(int argc, char** argv, bool load_capt
             if (probe_node["regex"]) {
               probe->regex = probe_node["regex"].as<std::string>();
             }
+            {
+              const std::string probe_group =
+                  probe_node["group"] ? probe_node["group"].as<std::string>() : "";
+              if (probe_node["function_arguments"]) {
+                for (const auto& fn_args : probe_node["function_arguments"]) {
+                  const std::string function_name = fn_args.first.as<std::string>();
+                  std::vector<ProbeArgCaptureSpec> specs;
+                  for (const auto& arg_node : fn_args.second) {
+                    ProbeArgCaptureSpec spec;
+                    spec.index = arg_node["index"].as<unsigned int>();
+                    spec.label = arg_node["label"] ? arg_node["label"].as<std::string>() : "";
+                    spec.num_bytes =
+                        arg_node["num_bytes"] ? arg_node["num_bytes"].as<unsigned int>() : 8U;
+                    spec.is_pointer =
+                        arg_node["is_pointer"] ? arg_node["is_pointer"].as<bool>() : false;
+                    spec.c_type = arg_node["c_type"] ? arg_node["c_type"].as<std::string>()
+                                                     : "unsigned long";
+                    spec.group =
+                        arg_node["group"] ? arg_node["group"].as<std::string>() : probe_group;
+                    specs.push_back(std::move(spec));
+                  }
+                  probe->function_arguments[function_name] = std::move(specs);
+                }
+              }
+            }
             this->capture_probes.push_back(probe);
           }
         }

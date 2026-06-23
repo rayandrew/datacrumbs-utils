@@ -1501,9 +1501,18 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::extractProbes() {
         DC_LOG_WARN("Unknown capture type encountered!");
     }
 
+    for (const auto& [function_name, arg_specs] : capture_probe->function_arguments) {
+      if (std::find(functionNames.begin(), functionNames.end(), function_name) ==
+          functionNames.end()) {
+        functionNames.push_back(function_name);
+      }
+    }
     probe->functions = functionNames;
     attach_discovered_function_signatures(probe.get(), capture_probe->probe_type, functionNames,
                                           discovered_function_signatures);
+    for (const auto& [function_name, arg_specs] : capture_probe->function_arguments) {
+      probe->function_arguments[function_name] = arg_specs;
+    }
 
     // Validate the probe before adding
     if (!probe->validate()) {

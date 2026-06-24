@@ -129,6 +129,11 @@ build_ssh_target() {
 	echo "${node}"
 }
 
+node_is_local() {
+	local node="${1%%@*}"
+	[[ -z "${node}" || "${node}" == localhost || "${node}" == "$(hostname)" || "${node}" == "$(hostname -s)" ]]
+}
+
 format_command() {
 	local formatted=""
 	local arg
@@ -172,6 +177,12 @@ run_remote_sudo_script() {
 	local description="$2"
 	local script_body="$3"
 	shift 3
+
+	if node_is_local "${node}"; then
+		run_local_sudo_script "${description}" "${script_body}" "$@"
+		return $?
+	fi
+
 	local target
 	target=$(build_ssh_target "${node}")
 
@@ -239,18 +250,35 @@ remote_write_env_and_start_service() {
 		return 0
 	fi
 
-	sudo ssh "${target}" bash -s -- "${run_id}" "${probe_file}" "${DATACRUMBS_REMOTE_RUN_DIR}" <<'EOF'
+	# The datacrumbs@.service unit reads probe file, user, run id and log dir from
+	# the per-run env file, so write all four (not just the probe file).
+	local body
+	body=$(cat <<'EOF'
 run_id="$1"
 probe_file="$2"
 run_dir="$3"
+dc_user="$4"
+log_dir="$5"
 env_file="${run_dir}/datacrumbs-${run_id}.env"
-escaped_probe_file="${probe_file//\\/\\\\}"
-escaped_probe_file="${escaped_probe_file//\"/\\\"}"
+esc() { local s="$1"; s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; printf '%s' "${s}"; }
 sudo mkdir -p "${run_dir}"
-printf 'DATACRUMBS_PROBE_FILE="%s"\n' "${escaped_probe_file}" | sudo tee "${env_file}" >/dev/null
+{
+	printf 'DATACRUMBS_PROBE_FILE="%s"\n' "$(esc "${probe_file}")"
+	printf 'DATACRUMBS_USER="%s"\n' "$(esc "${dc_user}")"
+	printf 'DATACRUMBS_SERVICE_RUN_ID="%s"\n' "$(esc "${run_id}")"
+	printf 'DATACRUMBS_LOG_DIR="%s"\n' "$(esc "${log_dir}")"
+} | sudo tee "${env_file}" >/dev/null
 sudo chmod 0644 "${env_file}" 2>/dev/null || true
 sudo systemctl start "datacrumbs@${run_id}.service"
 EOF
+	)
+	local -a args=("${run_id}" "${probe_file}" "${DATACRUMBS_REMOTE_RUN_DIR}" \
+		"${DATACRUMBS_USER:-$(id -un)}" "${DATACRUMBS_LOG_DIR:-}")
+	if node_is_local "${node}"; then
+		printf '%s\n' "${body}" | bash -s -- "${args[@]}"
+	else
+		printf '%s\n' "${body}" | sudo ssh "${target}" bash -s -- "${args[@]}"
+	fi
 }
 
 remote_stop_service_and_remove_env() {
@@ -264,13 +292,20 @@ remote_stop_service_and_remove_env() {
 		return 0
 	fi
 
-	sudo ssh "${target}" bash -s -- "${run_id}" "${DATACRUMBS_REMOTE_RUN_DIR}" <<'EOF'
+	local body
+	body=$(cat <<'EOF'
 run_id="$1"
 run_dir="$2"
 env_file="${run_dir}/datacrumbs-${run_id}.env"
 sudo systemctl stop "datacrumbs@${run_id}.service"
 sudo rm -f "${env_file}"
 EOF
+	)
+	if node_is_local "${node}"; then
+		printf '%s\n' "${body}" | bash -s -- "${run_id}" "${DATACRUMBS_REMOTE_RUN_DIR}"
+	else
+		printf '%s\n' "${body}" | sudo ssh "${target}" bash -s -- "${run_id}" "${DATACRUMBS_REMOTE_RUN_DIR}"
+	fi
 }
 
 run_parallel_node_action() {

@@ -37,4 +37,4 @@ fi
 
 DATACRUMBS_RESOLVED_RUN_ID=$(resolve_run_id "${DATACRUMBS_RUN_RUN_ID:-}")
 log "Starting datacrumbs@${DATACRUMBS_RESOLVED_RUN_ID}.service on ${#DATACRUMBS_NODES[@]} node(s)"
-run_parallel_node_action "start" "${DATACRUMBS_RUN_SSH_USER:-}" "${DATACRUMBS_RESOLVED_RUN_ID}" "${DATACRUMBS_RUN_PROBE_FILE}" "${DATACRUMBS_NODES[@]}"
+run_parallel_node_action "start" "${DATACRUMBS_RESOLVED_RUN_ID}" "${DATACRUMBS_RUN_PROBE_FILE}" "${DATACRUMBS_NODES[@]}"

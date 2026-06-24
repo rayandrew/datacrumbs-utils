@@ -25,4 +25,4 @@ if [[ "${#DATACRUMBS_NODES[@]}" -eq 0 ]]; then
 fi
 
 log "Stopping datacrumbs@${DATACRUMBS_STOP_RUN_ID}.service on ${#DATACRUMBS_NODES[@]} node(s)"
-run_parallel_node_action "stop" "${DATACRUMBS_STOP_SSH_USER:-}" "${DATACRUMBS_STOP_RUN_ID}" "" "${DATACRUMBS_NODES[@]}"
+run_parallel_node_action "stop" "${DATACRUMBS_STOP_RUN_ID}" "" "${DATACRUMBS_NODES[@]}"

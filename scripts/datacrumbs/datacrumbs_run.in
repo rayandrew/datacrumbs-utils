@@ -10,6 +10,7 @@ dc_args_add_option "DATACRUMBS_RUN" "node-list" "MANDATORY" "Comma or space sepa
 dc_args_add_option "DATACRUMBS_RUN" "probe-file" "MANDATORY" "Signed probes json.gz path" "string"
 dc_args_add_option "DATACRUMBS_RUN" "run-id" "OPTIONAL" "Run id for the systemd instance" "string" ""
 dc_args_add_option "DATACRUMBS_RUN" "ssh-user" "OPTIONAL" "SSH user for remote nodes" "string" "$(default_ssh_user)"
+dc_args_add_option "DATACRUMBS_RUN" "env" "OPTIONAL" "Extra server env as ';'-separated KEY=VALUE pairs, e.g. 'DATACRUMBS_NIC_DEVICES=mlx5_0;DATACRUMBS_TELEMETRY_INTERVAL_MS=100'" "string" ""
 dc_args_parse "DATACRUMBS_RUN" "datacrumbs_run" "$@"
 
 if [[ -z "${DATACRUMBS_RUN_NODE_LIST:-}" || -z "${DATACRUMBS_RUN_PROBE_FILE:-}" ]]; then
@@ -36,5 +37,6 @@ if [[ "${#DATACRUMBS_NODES[@]}" -eq 0 ]]; then
 fi
 
 DATACRUMBS_RESOLVED_RUN_ID=$(resolve_run_id "${DATACRUMBS_RUN_RUN_ID:-}")
+export DATACRUMBS_EXTRA_ENV="${DATACRUMBS_RUN_ENV:-}"
 log "Starting datacrumbs@${DATACRUMBS_RESOLVED_RUN_ID}.service on ${#DATACRUMBS_NODES[@]} node(s)"
 run_parallel_node_action "start" "${DATACRUMBS_RESOLVED_RUN_ID}" "${DATACRUMBS_RUN_PROBE_FILE}" "${DATACRUMBS_NODES[@]}"

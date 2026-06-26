@@ -1340,7 +1340,9 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::extractProbes() {
       std::regex re(capture_probe->regex, std::regex_constants::icase);
       std::vector<std::string> filteredNames;
       for (const auto& name : functionNames) {
-        if (std::regex_match(name, re)) {
+        const auto pos = name.find(':');
+        const std::string base_name = (pos != std::string::npos) ? name.substr(0, pos) : name;
+        if (std::regex_match(base_name, re)) {
           filteredNames.push_back(name);
         }
       }

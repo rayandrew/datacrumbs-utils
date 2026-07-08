@@ -1,0 +1,155 @@
+#! /usr/bin/env bash
+#
+# Deploy the dc_timesync cross-node time-reconciliation daemon (dc_timesync.service)
+# across a set of nodes so their datacrumbs traces land on ONE shared reference
+# timeline (clock_domain=global). One node is the REFERENCE; every other node
+# measures its NIC PHC vs the reference PHC (HW-timestamped exchange over IPv6
+# link-local) and publishes the fit to /dev/shm/dc_timesync.snapshot, which the
+# datacrumbs server reads to remap event timestamps.
+#
+# The remap is single-hop (not transitive), so EVERY node must reach the ONE
+# reference's link-local address directly on a PHC-bearing, HW-timestamping iface.
+#
+#   datacrumbs_deploy_timesync --node-list "sm7 sm8" --iface enp195s0f0np0 \
+#       --ref-node sm8-bf --ref-ll fe80::67:efff:fefe:7f2a
+#
+# If the reference is itself one of --node-list (a plain ssh+sudo host), omit
+# --ref-ll and pass --ref-iface; the ref's link-local is discovered over ssh and
+# the ref node is deployed in identity mode (self_id==ref_id, no peer). If the
+# reference is an offline DPU (deployed separately), pass --ref-ll explicitly and
+# keep it OUT of --node-list.
+
+SCRIPT_DIR=@DATACRUMBS_INSTALL_BINARYDIR@
+
+source "${SCRIPT_DIR}/datacrumbs_args"
+source "${SCRIPT_DIR}/datacrumbs_setup"
+
+dc_args_init "DATACRUMBS_DEPLOY_TIMESYNC"
+dc_args_add_option "DATACRUMBS_DEPLOY_TIMESYNC" "node-list" "MANDATORY" "Comma or space separated nodes to run dc_timesync.service on" "string"
+dc_args_add_option "DATACRUMBS_DEPLOY_TIMESYNC" "iface" "MANDATORY" "PHC-bearing, HW-timestamping netdev each node uses for the exchange (e.g. enp195s0f0np0)" "string"
+dc_args_add_option "DATACRUMBS_DEPLOY_TIMESYNC" "ref-node" "MANDATORY" "Reference node name/id (its PHC defines the shared timeline)" "string"
+dc_args_add_option "DATACRUMBS_DEPLOY_TIMESYNC" "ref-ll" "OPTIONAL" "Reference node's bare link-local IPv6 on its iface (no %zone). If unset, discovered over ssh via --ref-iface" "string"
+dc_args_add_option "DATACRUMBS_DEPLOY_TIMESYNC" "ref-iface" "OPTIONAL" "Iface on --ref-node to discover the link-local from (default: --iface). Only used when --ref-ll is unset" "string"
+dc_args_add_option "DATACRUMBS_DEPLOY_TIMESYNC" "ref-id" "OPTIONAL" "Numeric id label for the reference (default: trailing digits of --ref-node)" "string"
+dc_args_add_option "DATACRUMBS_DEPLOY_TIMESYNC" "cadence-ms" "OPTIONAL" "Measurement/publish cadence in ms (default 1000)" "string"
+dc_args_add_option "DATACRUMBS_DEPLOY_TIMESYNC" "unsetup" "OPTIONAL" "Remove dc_timesync.service instead of installing it" "bool"
+dc_args_parse "DATACRUMBS_DEPLOY_TIMESYNC" "datacrumbs_deploy_timesync" "$@"
+
+check_regular_user
+require_command ssh
+
+readonly DC_TS_SYSTEMD_DIR="@datacrumbs_INSTALL_SYSCONFDIR@/systemd"
+readonly DC_TS_RUN_DIR="@DATACRUMBS_INSTALL_RUNSTATEDIR@/datacrumbs" # matches the unit's EnvironmentFile dir
+readonly DC_TS_ENV_FILE="${DC_TS_RUN_DIR}/dc_timesync.env"
+readonly DC_TS_UNIT_LINK="/etc/systemd/system/dc_timesync.service"
+
+# trailing digits of a node name -> numeric id label (sm8-bf -> 8, sm7 -> 7); fallback 0.
+node_id() {
+	local n="$1" d
+	d="$(printf '%s' "${n}" | grep -oE '[0-9]+' | head -1)"
+	printf '%s' "${d:-0}"
+}
+
+mapfile -t DC_TS_NODES < <(expand_node_list "${DATACRUMBS_DEPLOY_TIMESYNC_NODE_LIST}")
+if [[ "${#DC_TS_NODES[@]}" -eq 0 ]]; then
+	error "No nodes resolved from node list: ${DATACRUMBS_DEPLOY_TIMESYNC_NODE_LIST}"
+	exit 1
+fi
+
+readonly DC_TS_IFACE="${DATACRUMBS_DEPLOY_TIMESYNC_IFACE}"
+readonly DC_TS_REF_NODE="${DATACRUMBS_DEPLOY_TIMESYNC_REF_NODE}"
+readonly DC_TS_REF_IFACE="${DATACRUMBS_DEPLOY_TIMESYNC_REF_IFACE:-${DC_TS_IFACE}}"
+readonly DC_TS_CADENCE="${DATACRUMBS_DEPLOY_TIMESYNC_CADENCE_MS:-1000}"
+DC_TS_REF_ID="${DATACRUMBS_DEPLOY_TIMESYNC_REF_ID:-$(node_id "${DC_TS_REF_NODE}")}"
+
+# ---- teardown -------------------------------------------------------------
+readonly DC_TS_UNINSTALL_SCRIPT='
+systemctl disable --now dc_timesync.service 2>/dev/null || true
+rm -f /etc/systemd/system/dc_timesync.service
+rm -f __ENV_FILE__
+systemctl daemon-reload
+echo "dc_timesync removed on $(hostname -s)"
+'
+
+if [[ "${DATACRUMBS_DEPLOY_TIMESYNC_UNSETUP:-0}" == "1" ]]; then
+	log "Removing dc_timesync.service from ${#DC_TS_NODES[@]} node(s)"
+	run_parallel_remote_sudo_script \
+		"remove dc_timesync.service" \
+		"${DC_TS_UNINSTALL_SCRIPT//__ENV_FILE__/${DC_TS_ENV_FILE}}" \
+		-- \
+		"${DC_TS_NODES[@]}"
+	exit $?
+fi
+
+# ---- discover the reference link-local ------------------------------------
+DC_TS_REF_LL="${DATACRUMBS_DEPLOY_TIMESYNC_REF_LL:-}"
+if [[ -z "${DC_TS_REF_LL}" ]]; then
+	log "Discovering ${DC_TS_REF_NODE} link-local on ${DC_TS_REF_IFACE}"
+	# bare fe80 address (strip /prefix and any %zone); regular user, no sudo needed
+	if node_is_local "${DC_TS_REF_NODE}"; then
+		DC_TS_REF_LL="$(ip -6 -o addr show scope link dev "${DC_TS_REF_IFACE}" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | cut -d% -f1 | head -1)"
+	else
+		DC_TS_REF_LL="$(ssh "${DC_TS_REF_NODE}" "ip -6 -o addr show scope link dev ${DC_TS_REF_IFACE}" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | cut -d% -f1 | head -1)"
+	fi
+	if [[ -z "${DC_TS_REF_LL}" ]]; then
+		error "Could not discover a link-local IPv6 for ${DC_TS_REF_NODE} on ${DC_TS_REF_IFACE}; pass --ref-ll explicitly"
+		exit 1
+	fi
+	log "Reference link-local: ${DC_TS_REF_LL}"
+fi
+
+# ---- per-node install -----------------------------------------------------
+# Runs as root on each node. Positional args: $1 self_id $2 ref_id $3 ref_ll
+# $4 iface $5 cadence_ms. Empty ref_ll => identity (reference) mode.
+readonly DC_TS_INSTALL_SCRIPT='
+set -e
+SELF_ID="$1"; REF_ID="$2"; REF_LL="$3"; IFACE="$4"; CADENCE="$5"
+RUN_DIR="__RUN_DIR__"; SYSTEMD_DIR="__SYSTEMD_DIR__"
+install -d "$RUN_DIR"
+umask 022
+cat > "__ENV_FILE__" <<ENV
+DC_TIMESYNC_IFACE="$IFACE"
+DC_TIMESYNC_SELF_ID="$SELF_ID"
+DC_TIMESYNC_REF_ID="$REF_ID"
+DC_TIMESYNC_REF_LL="$REF_LL"
+DC_TIMESYNC_CADENCE_MS="$CADENCE"
+ENV
+chmod 0644 "__ENV_FILE__"
+install -d /etc/systemd/system
+ln -sfn "$SYSTEMD_DIR/dc_timesync.service" "__UNIT_LINK__"
+systemctl daemon-reload
+systemctl reset-failed dc_timesync.service 2>/dev/null || true
+systemctl enable dc_timesync.service 2>/dev/null || true
+# restart (not just enable --now) so a re-run with changed env params actually
+# takes effect -- enable --now is a no-op on an already-active service.
+systemctl restart dc_timesync.service
+sleep 2
+echo "$(hostname -s): self=$SELF_ID ref=$REF_ID iface=$IFACE ref_ll=${REF_LL:-<identity>} -> $(systemctl is-active dc_timesync.service)"
+'
+DC_TS_BODY="${DC_TS_INSTALL_SCRIPT//__RUN_DIR__/${DC_TS_RUN_DIR}}"
+DC_TS_BODY="${DC_TS_BODY//__SYSTEMD_DIR__/${DC_TS_SYSTEMD_DIR}}"
+DC_TS_BODY="${DC_TS_BODY//__ENV_FILE__/${DC_TS_ENV_FILE}}"
+DC_TS_BODY="${DC_TS_BODY//__UNIT_LINK__/${DC_TS_UNIT_LINK}}"
+
+log "Deploying dc_timesync.service on ${#DC_TS_NODES[@]} node(s); reference=${DC_TS_REF_NODE} (id=${DC_TS_REF_ID}, ll=${DC_TS_REF_LL})"
+rc=0
+for node in "${DC_TS_NODES[@]}"; do
+	[[ -z "${node}" ]] && continue
+	# Identity (reference) mode is decided by NAME only -- id labels can collide
+	# across a host and its DPU (sm8 and sm8-bf both trail in "8").
+	if [[ "${node}" == "${DC_TS_REF_NODE}" ]]; then
+		self_id="${DC_TS_REF_ID}"
+		ref_ll=""
+	else
+		self_id="$(node_id "${node}")"
+		# keep the reference's id label unique: bump a non-ref node that collides.
+		[[ "${self_id}" == "${DC_TS_REF_ID}" ]] && self_id="$((self_id + 100))"
+		ref_ll="${DC_TS_REF_LL}"
+	fi
+	if ! run_remote_sudo_script "${node}" "deploy dc_timesync.service" "${DC_TS_BODY}" \
+		"${self_id}" "${DC_TS_REF_ID}" "${ref_ll}" "${DC_TS_IFACE}" "${DC_TS_CADENCE}"; then
+		error "Failed to deploy dc_timesync.service on ${node}"
+		rc=1
+	fi
+done
+exit "${rc}"

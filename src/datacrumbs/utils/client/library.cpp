@@ -24,6 +24,8 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <unordered_set>
+
 /**
  * Internal headers
  */
@@ -87,17 +89,22 @@ static struct ibv_cq* (*dc_real_create_cq)(struct ibv_context*, int, void*,
 static int (*dc_orig_poll_cq)(struct ibv_cq*, int, struct ibv_wc*) = nullptr;
 static int dc_wallclock = 0;  // 1 = NIC exposes wallclock-ns completion timestamps
 
-// Registry of the extended CQs WE created. Hijacking context->ops.poll_cq affects every CQ on the
-// context, but only ours are extended; polling a non-extended CQ as extended would deref a garbage
-// start_poll pointer (the intermittent crash). So dc_poll_cq only bridges our CQs and delegates
-// any other to the original provider poll.
-#define DC_MAX_CQ 512
-static struct ibv_cq* dc_our_cqs[DC_MAX_CQ];
-static int dc_ncq = 0;
-static int dc_is_ours(struct ibv_cq* cq) {
-  for (int i = 0; i < dc_ncq; i++)
-    if (dc_our_cqs[i] == cq) return 1;
-  return 0;
+// HW-ts interception costs a poll-path indirection per poll -> opt in via DC_HWTS; otherwise the
+// client is a thin passthrough (native poll speed) that still provides the pid gate. Cached.
+static int dc_hwts_on() {
+  static int v = -1;
+  if (v < 0) {
+    const char* e = getenv("DC_HWTS");
+    v = (e && *e && e[0] != '0') ? 1 : 0;
+  }
+  return v;
+}
+
+// Extended CQs WE created (O(1) membership). Only ours are extended; polling a non-extended CQ as
+// extended derefs a garbage start_poll pointer -> dc_poll_cq bridges ours, delegates the rest.
+static std::unordered_set<struct ibv_cq*> dc_our_cqs;
+static inline int dc_is_ours(struct ibv_cq* cq) {
+  return dc_our_cqs.find(cq) != dc_our_cqs.end();
 }
 
 // bridge invoked in place of the provider poll_cq (via the hijacked context->ops.poll_cq): runs the
@@ -137,6 +144,9 @@ __attribute__((visibility("default"))) struct ibv_cq* ibv_create_cq(
     dc_real_create_cq =
         (struct ibv_cq * (*)(struct ibv_context*, int, void*, struct ibv_comp_channel*, int))
             dlvsym(RTLD_NEXT, "ibv_create_cq", "IBVERBS_1.1");
+  if (!dc_hwts_on())  // opt-out of HW-ts -> native passthrough
+    return dc_real_create_cq ? dc_real_create_cq(context, cqe, cq_context, channel, comp_vector)
+                             : nullptr;
   dc_wallclock = 1;
 
   struct ibv_cq_init_attr_ex attr = {0};
@@ -155,7 +165,7 @@ __attribute__((visibility("default"))) struct ibv_cq* ibv_create_cq(
   if (!dc_orig_poll_cq) dc_orig_poll_cq = context->ops.poll_cq;  // save real provider poll once
   context->ops.poll_cq = dc_poll_cq;  // the app's inlined ibv_poll_cq dispatches here
   struct ibv_cq* ret = ibv_cq_ex_to_cq(cqx);
-  if (dc_ncq < DC_MAX_CQ) dc_our_cqs[dc_ncq++] = ret;  // remember it is extended
+  dc_our_cqs.insert(ret);
   return ret;
 }
 

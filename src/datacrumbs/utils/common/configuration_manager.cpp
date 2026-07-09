@@ -400,8 +400,9 @@ ConfigurationManager::ConfigurationManager(int argc, char** argv, bool load_capt
                         arg_node["num_bytes"] ? arg_node["num_bytes"].as<unsigned int>() : 8U;
                     spec.is_pointer =
                         arg_node["is_pointer"] ? arg_node["is_pointer"].as<bool>() : false;
-                    spec.c_type = arg_node["c_type"] ? arg_node["c_type"].as<std::string>()
-                                                     : "unsigned long";
+                    spec.offset = arg_node["offset"] ? arg_node["offset"].as<unsigned int>() : 0U;
+                    spec.c_type =
+                        arg_node["c_type"] ? arg_node["c_type"].as<std::string>() : "unsigned long";
                     spec.group =
                         arg_node["group"] ? arg_node["group"].as<std::string>() : probe_group;
                     specs.push_back(std::move(spec));

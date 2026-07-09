@@ -60,19 +60,20 @@ extern "C" __attribute__((visibility("default"))) void datacrumbs_stop() {
  * (ibv_poll_cq is a static inline dispatching through cq->context->ops.poll_cq), so neither eBPF
  * nor plain interposition can time the wire. Here we transparently upgrade each CQ to a timestamped
  * EXTENDED CQ (ibv_create_cq_ex) and hijack that poll dispatch. Per completion we call the real
- * symbol datacrumbs_rdma_completion(hw_ns, wr_id, opcode); datacrumbs uprobes it and captures the
- * args, so each .pfw event carries the CPU timestamp (event ts) AND the NIC hardware timestamp
- * (arg) -- the CPU<->hardware correlation eBPF cannot produce on its own.
+ * symbol datacrumbs_rdma_completion(hw_ns, wr_id, opcode, imm, qp_num); datacrumbs uprobes it, so
+ * each .pfw event carries the CPU timestamp (event ts) AND the NIC hardware timestamp + wire join
+ * keys (args) -- the CPU<->hardware correlation eBPF cannot produce on its own.
  */
 extern "C" {
 
-// emit point: the server uprobes this and captures args[0..2]. noinline + the asm clobber keep it
+// emit point: the server uprobes this and captures the args. noinline + the asm clobber keep it
 // a real, uninlined, argument-carrying symbol.
 static unsigned long long dc_emit_count = 0;  // DC_DEBUG diagnostic only
-__attribute__((noinline, visibility("default"))) void datacrumbs_rdma_completion(uint64_t hw_ns,
-                                                                                 uint64_t wr_id,
-                                                                                 uint32_t opcode) {
-  __asm__ __volatile__("" ::"r"(hw_ns), "r"(wr_id), "r"(opcode) : "memory");
+// imm/qp_num: wire-observable join keys read from the completion (no app change). imm is valid on
+// recv-with-immediate only (tag=imm&0xFF, slot=imm>>8); qp_num separates QPs/legs.
+__attribute__((noinline, visibility("default"))) void datacrumbs_rdma_completion(
+    uint64_t hw_ns, uint64_t wr_id, uint32_t opcode, uint32_t imm, uint32_t qp_num) {
+  __asm__ __volatile__("" ::"r"(hw_ns), "r"(wr_id), "r"(opcode), "r"(imm), "r"(qp_num) : "memory");
   dc_emit_count++;
 }
 __attribute__((destructor)) static void dc_emit_report(void) {
@@ -119,7 +120,9 @@ static int dc_poll_cq(struct ibv_cq* cq, int ne, struct ibv_wc* wc) {
     if (wc[i].wc_flags & IBV_WC_WITH_IMM) wc[i].imm_data = ibv_wc_read_imm_data(cqx);
     uint64_t hw =
         dc_wallclock ? ibv_wc_read_completion_wallclock_ns(cqx) : ibv_wc_read_completion_ts(cqx);
-    datacrumbs_rdma_completion(hw, cqx->wr_id, (uint32_t)wc[i].opcode);
+    datacrumbs_rdma_completion(hw, cqx->wr_id, (uint32_t)wc[i].opcode,
+                               (wc[i].wc_flags & IBV_WC_WITH_IMM) ? wc[i].imm_data : 0,
+                               wc[i].qp_num);
     i++;
   } while (ibv_next_poll(cqx) == 0);
   ibv_end_poll(cqx);

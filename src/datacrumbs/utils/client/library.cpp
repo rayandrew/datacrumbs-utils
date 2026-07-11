@@ -14,6 +14,7 @@
 /**
  * Standard headers
  */
+#include <arpa/inet.h>
 #include <dlfcn.h>
 #include <execinfo.h>
 #include <fcntl.h>
@@ -27,6 +28,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <mutex>
+#include <unordered_map>
 #include <unordered_set>
 
 /**
@@ -179,6 +182,49 @@ static inline int dc_is_ours(struct ibv_cq* cq) {
   return dc_our_cqs.find(cq) != dc_our_cqs.end();
 }
 
+// ---- posted-imm correlation (reorder-robust per-message wire key on the SENDER) ----
+// A SEND completion carries no immediate, but the wire key (for DDS the response-ring TailC =
+// htonl(imm) on RDMA_WRITE_WITH_IMM) is known at POST. RC QP completions are in-order with the
+// SIGNALED posts on that QP, so a per-QP ring of posted imms (pushed at post, popped at completion)
+// lets each send completion recover its posted imm. Joining host(recv imm) == DPU(posted imm) is then
+// robust to cross-QP reordering (concurrency), unlike index-order pairing. Opt-in via DC_HWTS (same
+// gate as the CQ upgrade). Single-reactor SPDK posts+polls a QP on one thread -> no lock; DC_QRING
+// >> in-flight depth keeps push/pop aligned (only SIGNALED posts are pushed, matching completions).
+#define DC_QRING 8192
+struct dc_qimm {
+  uint32_t ring[DC_QRING];
+  uint64_t post = 0, done = 0;
+};
+static std::unordered_map<uint32_t, dc_qimm*> dc_qimm_map;  // keyed by qp_num
+static std::mutex dc_qimm_mtx;  // guards the MAP only (concurrent host has many threads); the per-QP
+                                // ring is single-threaded (one QP is serviced by one thread).
+static dc_qimm* dc_qimm_for(uint32_t qpn) {
+  std::lock_guard<std::mutex> lk(dc_qimm_mtx);
+  auto it = dc_qimm_map.find(qpn);
+  if (it != dc_qimm_map.end()) return it->second;
+  dc_qimm* q = new dc_qimm();
+  dc_qimm_map[qpn] = q;
+  return q;
+}
+static int (*dc_orig_post_send)(struct ibv_qp*, struct ibv_send_wr*, struct ibv_send_wr**) = nullptr;
+// hijacked context->ops.post_send: record each SIGNALED post's imm (0 unless *_WITH_IMM) per QP, in
+// order, so the matching send completion can recover it. Delegates to the real provider post_send.
+static int dc_post_send(struct ibv_qp* qp, struct ibv_send_wr* wr, struct ibv_send_wr** bad) {
+  dc_qimm* q = dc_qimm_for(qp->qp_num);
+  for (struct ibv_send_wr* w = wr; w; w = w->next) {
+    if (!(w->send_flags & IBV_SEND_SIGNALED)) continue;  // only signaled WRs complete
+    uint32_t imm = 0;
+    if (w->opcode == IBV_WR_RDMA_WRITE_WITH_IMM || w->opcode == IBV_WR_SEND_WITH_IMM)
+      imm = ntohl(w->imm_data);
+    q->ring[q->post++ & (DC_QRING - 1)] = imm;
+  }
+  return dc_orig_post_send ? dc_orig_post_send(qp, wr, bad) : -1;
+}
+// recv-class completions carry the received immediate directly; send-class recover it from the ring.
+static inline int dc_is_recv_op(unsigned op) {
+  return op == IBV_WC_RECV || op == IBV_WC_RECV_RDMA_WITH_IMM;
+}
+
 // bridge invoked in place of the provider poll_cq (via the hijacked context->ops.poll_cq): runs the
 // extended poll, reads the hardware completion timestamp, and fills the app's legacy ibv_wc.
 static int dc_poll_cq(struct ibv_cq* cq, int ne, struct ibv_wc* wc) {
@@ -198,7 +244,15 @@ static int dc_poll_cq(struct ibv_cq* cq, int ne, struct ibv_wc* wc) {
     if (wc[i].wc_flags & IBV_WC_WITH_IMM) wc[i].imm_data = ibv_wc_read_imm_data(cqx);
     uint64_t hw =
         dc_wallclock ? ibv_wc_read_completion_wallclock_ns(cqx) : ibv_wc_read_completion_ts(cqx);
-    uint32_t imm = (wc[i].wc_flags & IBV_WC_WITH_IMM) ? wc[i].imm_data : 0;
+    // imm = the wire key. Recv-class: the received immediate. Send-class: the posted immediate
+    // recovered from the per-QP ring (the completion itself carries none) -> both sides share TailC.
+    uint32_t imm;
+    if (dc_is_recv_op(wc[i].opcode)) {
+      imm = (wc[i].wc_flags & IBV_WC_WITH_IMM) ? wc[i].imm_data : 0;
+    } else {
+      dc_qimm* q = dc_qimm_for(wc[i].qp_num);
+      imm = (q->done < q->post) ? q->ring[q->done++ & (DC_QRING - 1)] : 0;
+    }
     dc_hwts_emit(hw, cqx->wr_id, (uint32_t)wc[i].opcode, imm, wc[i].qp_num);  // client self-emit
     if (dc_uprobe_on())  // opt-in hot path: per-completion kernel trap, unsafe on bulk data planes
       datacrumbs_rdma_completion(hw, cqx->wr_id, (uint32_t)wc[i].opcode, imm, wc[i].qp_num);
@@ -240,6 +294,8 @@ __attribute__((visibility("default"))) struct ibv_cq* ibv_create_cq(
   }
   if (!dc_orig_poll_cq) dc_orig_poll_cq = context->ops.poll_cq;  // save real provider poll once
   context->ops.poll_cq = dc_poll_cq;  // the app's inlined ibv_poll_cq dispatches here
+  if (!dc_orig_post_send) dc_orig_post_send = context->ops.post_send;  // for posted-imm correlation
+  context->ops.post_send = dc_post_send;
   struct ibv_cq* ret = ibv_cq_ex_to_cq(cqx);
   dc_our_cqs.insert(ret);
   return ret;

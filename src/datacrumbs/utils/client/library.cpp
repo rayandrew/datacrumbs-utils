@@ -79,6 +79,7 @@ extern "C" {
 // emit point: the server uprobes this and captures the args. noinline + the asm clobber keep it
 // a real, uninlined, argument-carrying symbol.
 static unsigned long long dc_emit_count = 0;  // DC_DEBUG diagnostic only
+static unsigned long long dc_post_seen = 0, dc_post_imm = 0, dc_post_unsig = 0;  // DC_DEBUG only
 // imm/qp_num: wire-observable join keys read from the completion (no app change). imm is valid on
 // recv-with-immediate only (tag=imm&0xFF, slot=imm>>8); qp_num separates QPs/legs.
 __attribute__((noinline, visibility("default"))) void datacrumbs_rdma_completion(
@@ -88,8 +89,10 @@ __attribute__((noinline, visibility("default"))) void datacrumbs_rdma_completion
 }
 __attribute__((destructor)) static void dc_emit_report(void) {
   if (getenv("DC_DEBUG"))
-    fprintf(stderr, "[dc-client] rdma completions emitted=%llu (pid %d)\n", dc_emit_count,
-            getpid());
+    fprintf(stderr,
+            "[dc-client] rdma completions emitted=%llu post_send seen=%llu with_imm=%llu unsig=%llu "
+            "(pid %d)\n",
+            dc_emit_count, dc_post_seen, dc_post_imm, dc_post_unsig, getpid());
 }
 
 // ---- client-side hardware-timestamp sink (per-thread, lock-free, periodically flushed) ----
@@ -212,10 +215,22 @@ static int (*dc_orig_post_send)(struct ibv_qp*, struct ibv_send_wr*, struct ibv_
 static int dc_post_send(struct ibv_qp* qp, struct ibv_send_wr* wr, struct ibv_send_wr** bad) {
   dc_qimm* q = dc_qimm_for(qp->qp_num);
   for (struct ibv_send_wr* w = wr; w; w = w->next) {
-    if (!(w->send_flags & IBV_SEND_SIGNALED)) continue;  // only signaled WRs complete
+    dc_post_seen++;
+    if (w->opcode == IBV_WR_RDMA_WRITE_WITH_IMM || w->opcode == IBV_WR_SEND_WITH_IMM) dc_post_imm++;
+    if (!(w->send_flags & IBV_SEND_SIGNALED)) {
+      dc_post_unsig++;
+      continue;  // only signaled WRs complete
+    }
     uint32_t imm = 0;
-    if (w->opcode == IBV_WR_RDMA_WRITE_WITH_IMM || w->opcode == IBV_WR_SEND_WITH_IMM)
+    if (w->opcode == IBV_WR_RDMA_WRITE_WITH_IMM || w->opcode == IBV_WR_SEND_WITH_IMM) {
       imm = ntohl(w->imm_data);
+      // opcode=250 = a POST marker (hw_ns=0, cpu_ns=post time): records the WITH_IMM wire key even
+      // when the send is UNSIGNALED and thus has no completion (e.g. the DDS response-meta write,
+      // wr_id=9, imm=TailC). This is the reorder-robust join key the receiver also sees (its recv imm);
+      // the completion ring below covers the signaled case. NB post time is software (cpu_ns) -> for a
+      // precise wire, pair this key to the nearest signaled completion on the same QP.
+      dc_hwts_emit(0, w->wr_id, 250, imm, qp->qp_num);
+    }
     q->ring[q->post++ & (DC_QRING - 1)] = imm;
   }
   return dc_orig_post_send ? dc_orig_post_send(qp, wr, bad) : -1;

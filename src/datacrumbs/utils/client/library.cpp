@@ -117,7 +117,6 @@ static int dc_poll_cq(struct ibv_cq* cq, int ne, struct ibv_wc* wc) {
   if (ibv_start_poll(cqx, &attr)) return 0;  // ENOENT/empty or error
   int i = 0;
   do {
-    if (i >= ne) break;
     wc[i].wr_id = cqx->wr_id;
     wc[i].status = cqx->status;
     wc[i].opcode = ibv_wc_read_opcode(cqx);
@@ -131,6 +130,10 @@ static int dc_poll_cq(struct ibv_cq* cq, int ne, struct ibv_wc* wc) {
                                (wc[i].wc_flags & IBV_WC_WITH_IMM) ? wc[i].imm_data : 0,
                                wc[i].qp_num);
     i++;
+    // Break BEFORE ibv_next_poll: it advances to (and consumes) the next completion, so breaking
+    // after it silently DROPS that completion. Harmless for one-at-a-time busy-poll (buddy, host
+    // DuckDB); fatal for burst consumers -- the DDS backend polls ne=1 with 2+ ready and hangs.
+    if (i >= ne) break;
   } while (ibv_next_poll(cqx) == 0);
   ibv_end_poll(cqx);
   return i;

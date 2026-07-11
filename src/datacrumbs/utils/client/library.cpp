@@ -28,8 +28,6 @@
 #include <time.h>
 #include <unistd.h>
 
-#include <mutex>
-#include <unordered_map>
 #include <unordered_set>
 
 /**
@@ -79,7 +77,7 @@ extern "C" {
 // emit point: the server uprobes this and captures the args. noinline + the asm clobber keep it
 // a real, uninlined, argument-carrying symbol.
 static unsigned long long dc_emit_count = 0;  // DC_DEBUG diagnostic only
-static unsigned long long dc_post_seen = 0, dc_post_imm = 0, dc_post_unsig = 0;  // DC_DEBUG only
+static unsigned long long dc_post_imm = 0;  // DC_DEBUG only: count of WITH_IMM posts (wire keys)
 // imm/qp_num: wire-observable join keys read from the completion (no app change). imm is valid on
 // recv-with-immediate only (tag=imm&0xFF, slot=imm>>8); qp_num separates QPs/legs.
 __attribute__((noinline, visibility("default"))) void datacrumbs_rdma_completion(
@@ -89,10 +87,8 @@ __attribute__((noinline, visibility("default"))) void datacrumbs_rdma_completion
 }
 __attribute__((destructor)) static void dc_emit_report(void) {
   if (getenv("DC_DEBUG"))
-    fprintf(stderr,
-            "[dc-client] rdma completions emitted=%llu post_send seen=%llu with_imm=%llu unsig=%llu "
-            "(pid %d)\n",
-            dc_emit_count, dc_post_seen, dc_post_imm, dc_post_unsig, getpid());
+    fprintf(stderr, "[dc-client] rdma completions emitted=%llu with_imm posts=%llu (pid %d)\n",
+            dc_emit_count, dc_post_imm, getpid());
 }
 
 // ---- client-side hardware-timestamp sink (per-thread, lock-free, periodically flushed) ----
@@ -185,59 +181,22 @@ static inline int dc_is_ours(struct ibv_cq* cq) {
   return dc_our_cqs.find(cq) != dc_our_cqs.end();
 }
 
-// ---- posted-imm correlation (reorder-robust per-message wire key on the SENDER) ----
-// A SEND completion carries no immediate, but the wire key (for DDS the response-ring TailC =
-// htonl(imm) on RDMA_WRITE_WITH_IMM) is known at POST. RC QP completions are in-order with the
-// SIGNALED posts on that QP, so a per-QP ring of posted imms (pushed at post, popped at completion)
-// lets each send completion recover its posted imm. Joining host(recv imm) == DPU(posted imm) is then
-// robust to cross-QP reordering (concurrency), unlike index-order pairing. Opt-in via DC_HWTS (same
-// gate as the CQ upgrade). Single-reactor SPDK posts+polls a QP on one thread -> no lock; DC_QRING
-// >> in-flight depth keeps push/pop aligned (only SIGNALED posts are pushed, matching completions).
-#define DC_QRING 8192
-struct dc_qimm {
-  uint32_t ring[DC_QRING];
-  uint64_t post = 0, done = 0;
-};
-static std::unordered_map<uint32_t, dc_qimm*> dc_qimm_map;  // keyed by qp_num
-static std::mutex dc_qimm_mtx;  // guards the MAP only (concurrent host has many threads); the per-QP
-                                // ring is single-threaded (one QP is serviced by one thread).
-static dc_qimm* dc_qimm_for(uint32_t qpn) {
-  std::lock_guard<std::mutex> lk(dc_qimm_mtx);
-  auto it = dc_qimm_map.find(qpn);
-  if (it != dc_qimm_map.end()) return it->second;
-  dc_qimm* q = new dc_qimm();
-  dc_qimm_map[qpn] = q;
-  return q;
-}
+// ---- WITH_IMM post marker (reorder-robust wire key on the SENDER) ----
+// A send completion carries no immediate, and for DDS the response-meta write (RDMA_WRITE_WITH_IMM,
+// wr_id=9, imm=htonl(TailC)) is UNSIGNALED -> it has no completion at all. So at POST we emit the
+// wire key (opcode=250 marker, cpu_ns post time) for every *_WITH_IMM WR. The receiver sees the same
+// value as its recv imm -> TailC is a reorder-robust host<->DPU join key (survives concurrency, where
+// index-order pairing fails). Cheap: the hot post path only does one opcode check per WR; the marker
+// (and the sync CSV write) fire only on the rare WITH_IMM posts -- no per-completion map/lock/ring.
 static int (*dc_orig_post_send)(struct ibv_qp*, struct ibv_send_wr*, struct ibv_send_wr**) = nullptr;
-// hijacked context->ops.post_send: record each SIGNALED post's imm (0 unless *_WITH_IMM) per QP, in
-// order, so the matching send completion can recover it. Delegates to the real provider post_send.
 static int dc_post_send(struct ibv_qp* qp, struct ibv_send_wr* wr, struct ibv_send_wr** bad) {
-  dc_qimm* q = dc_qimm_for(qp->qp_num);
   for (struct ibv_send_wr* w = wr; w; w = w->next) {
-    dc_post_seen++;
-    if (w->opcode == IBV_WR_RDMA_WRITE_WITH_IMM || w->opcode == IBV_WR_SEND_WITH_IMM) dc_post_imm++;
-    if (!(w->send_flags & IBV_SEND_SIGNALED)) {
-      dc_post_unsig++;
-      continue;  // only signaled WRs complete
-    }
-    uint32_t imm = 0;
     if (w->opcode == IBV_WR_RDMA_WRITE_WITH_IMM || w->opcode == IBV_WR_SEND_WITH_IMM) {
-      imm = ntohl(w->imm_data);
-      // opcode=250 = a POST marker (hw_ns=0, cpu_ns=post time): records the WITH_IMM wire key even
-      // when the send is UNSIGNALED and thus has no completion (e.g. the DDS response-meta write,
-      // wr_id=9, imm=TailC). This is the reorder-robust join key the receiver also sees (its recv imm);
-      // the completion ring below covers the signaled case. NB post time is software (cpu_ns) -> for a
-      // precise wire, pair this key to the nearest signaled completion on the same QP.
-      dc_hwts_emit(0, w->wr_id, 250, imm, qp->qp_num);
+      dc_post_imm++;  // DC_DEBUG only
+      dc_hwts_emit(0, w->wr_id, 250, ntohl(w->imm_data), qp->qp_num);
     }
-    q->ring[q->post++ & (DC_QRING - 1)] = imm;
   }
   return dc_orig_post_send ? dc_orig_post_send(qp, wr, bad) : -1;
-}
-// recv-class completions carry the received immediate directly; send-class recover it from the ring.
-static inline int dc_is_recv_op(unsigned op) {
-  return op == IBV_WC_RECV || op == IBV_WC_RECV_RDMA_WITH_IMM;
 }
 
 // bridge invoked in place of the provider poll_cq (via the hijacked context->ops.poll_cq): runs the
@@ -259,15 +218,8 @@ static int dc_poll_cq(struct ibv_cq* cq, int ne, struct ibv_wc* wc) {
     if (wc[i].wc_flags & IBV_WC_WITH_IMM) wc[i].imm_data = ibv_wc_read_imm_data(cqx);
     uint64_t hw =
         dc_wallclock ? ibv_wc_read_completion_wallclock_ns(cqx) : ibv_wc_read_completion_ts(cqx);
-    // imm = the wire key. Recv-class: the received immediate. Send-class: the posted immediate
-    // recovered from the per-QP ring (the completion itself carries none) -> both sides share TailC.
-    uint32_t imm;
-    if (dc_is_recv_op(wc[i].opcode)) {
-      imm = (wc[i].wc_flags & IBV_WC_WITH_IMM) ? wc[i].imm_data : 0;
-    } else {
-      dc_qimm* q = dc_qimm_for(wc[i].qp_num);
-      imm = (q->done < q->post) ? q->ring[q->done++ & (DC_QRING - 1)] : 0;
-    }
+    // recv-with-imm carries the wire key directly; senders emit theirs at post (opcode=250 marker).
+    uint32_t imm = (wc[i].wc_flags & IBV_WC_WITH_IMM) ? wc[i].imm_data : 0;
     dc_hwts_emit(hw, cqx->wr_id, (uint32_t)wc[i].opcode, imm, wc[i].qp_num);  // client self-emit
     if (dc_uprobe_on())  // opt-in hot path: per-completion kernel trap, unsafe on bulk data planes
       datacrumbs_rdma_completion(hw, cqx->wr_id, (uint32_t)wc[i].opcode, imm, wc[i].qp_num);

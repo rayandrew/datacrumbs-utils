@@ -100,7 +100,9 @@ __attribute__((destructor)) static void dc_emit_report(void) {
 // Flushed every DC_SINK_FLUSH_N records (not just at destructor): the SPDK backend traps SIGTERM, so
 // a destructor-only flush would lose everything. The old hot path stays available via DC_HWTS_UPROBE.
 #define DC_SINK_BUF 65536
-#define DC_SINK_FLUSH_N 256
+#define DC_SINK_FLUSH_N 32  // flush cadence: low enough that a proxy killed/aborted mid-run still
+                            // leaves most completions on disk (destructor flush is skipped on SIGKILL/
+                            // abort); still ~1 write per 32 completions, negligible on the DDS firehose.
 struct dc_sink {
   int fd = -1;  // -2 = open failed once, stop trying
   size_t len = 0;

@@ -78,6 +78,13 @@ extern "C" {
 // a real, uninlined, argument-carrying symbol.
 static unsigned long long dc_emit_count = 0;  // DC_DEBUG diagnostic only
 static unsigned long long dc_post_imm = 0;  // DC_DEBUG only: count of WITH_IMM posts (wire keys)
+// capture-coverage counters: silently capturing NOTHING is indistinguishable from "no traffic", which
+// is how a failed CQ upgrade cost us a whole validation run. These drive the exit warning below.
+static unsigned long long dc_cq_total = 0;      // ibv_create_cq calls seen
+static unsigned long long dc_cq_captured = 0;   // upgraded to a timestamped extended CQ + poll hijacked
+static unsigned long long dc_cq_fallback = 0;   // upgrade failed -> plain CQ, NOT captured
+static unsigned long long dc_completions = 0;   // completions actually self-emitted
+static int dc_hwts_on(void);  // fwd decl (defined with the CQ interposition below)
 // imm/qp_num: wire-observable join keys read from the completion (no app change). imm is valid on
 // recv-with-immediate only (tag=imm&0xFF, slot=imm>>8); qp_num separates QPs/legs.
 __attribute__((noinline, visibility("default"))) void datacrumbs_rdma_completion(
@@ -87,8 +94,35 @@ __attribute__((noinline, visibility("default"))) void datacrumbs_rdma_completion
 }
 __attribute__((destructor)) static void dc_emit_report(void) {
   if (getenv("DC_DEBUG"))
-    fprintf(stderr, "[dc-client] rdma completions emitted=%llu with_imm posts=%llu (pid %d)\n",
-            dc_emit_count, dc_post_imm, getpid());
+    fprintf(stderr,
+            "[dc-client] rdma completions emitted=%llu with_imm posts=%llu self_emit=%llu "
+            "cq total=%llu captured=%llu fallback=%llu (pid %d)\n",
+            dc_emit_count, dc_post_imm, dc_completions, dc_cq_total, dc_cq_captured, dc_cq_fallback,
+            getpid());
+  // ALWAYS warn (not DC_DEBUG-gated): zero capture must never look like "no traffic".
+  // The worst case is dc_cq_total == 0: we were asked to capture RDMA and never even saw a CQ created,
+  // i.e. the app builds its CQ through an API we do not hook. NB ibv_create_cq_ex is a static inline
+  // dispatching via context->ops.create_cq_ex, so it is invisible both to us AND to `nm` on the binary
+  // -- "it imports ibv_create_cq" does NOT mean that is the path taken. Fix = hook the context ops.
+  if (dc_hwts_on() && dc_cq_total == 0)
+    fprintf(stderr,
+            "[dc-client] WARNING: DC_HWTS on but ZERO ibv_create_cq calls were intercepted (pid %d). "
+            "If this process does RDMA it is using a CQ path we do not hook (e.g. ibv_create_cq_ex, "
+            "which is an inline dispatching through context->ops, or DOCA/DevX). Capture is EMPTY -- "
+            "do not read that as 'no traffic'.\n",
+            getpid());
+  else if (dc_hwts_on() && dc_cq_total > 0 && dc_completions == 0)
+    fprintf(stderr,
+            "[dc-client] WARNING: DC_HWTS on, %llu CQ(s) created but ZERO completions captured"
+            "%s (pid %d). RDMA is not being traced -- do not read the empty output as 'no traffic'.\n",
+            dc_cq_total,
+            dc_cq_fallback ? "; the timestamped-CQ upgrade FAILED so poll was not hijacked" : "",
+            getpid());
+  else if (dc_hwts_on() && dc_cq_fallback > 0)
+    fprintf(stderr,
+            "[dc-client] WARNING: %llu of %llu CQ(s) fell back to a plain CQ (no hw timestamps); "
+            "capture is PARTIAL (pid %d).\n",
+            dc_cq_fallback, dc_cq_total, getpid());
 }
 
 // ---- client-side hardware-timestamp sink (per-thread, lock-free, periodically flushed) ----
@@ -157,6 +191,7 @@ static void dc_hwts_emit(uint64_t hw, uint64_t wr_id, uint32_t op, uint32_t imm,
                    (unsigned long long)cpu, (unsigned long long)hw, (unsigned long long)wr_id, op,
                    imm, qp);
   if (k > 0) s->len += (size_t)k;
+  dc_completions++;
   if (++s->n % DC_SINK_FLUSH_N == 0 || s->len + 128 >= sizeof(s->buf)) dc_sink_flush(s);
 }
 
@@ -167,7 +202,7 @@ static int dc_wallclock = 0;  // 1 = NIC exposes wallclock-ns completion timesta
 
 // HW-ts interception costs a poll-path indirection per poll -> opt in via DC_HWTS; otherwise the
 // client is a thin passthrough (native poll speed) that still provides the pid gate. Cached.
-static int dc_hwts_on() {
+static int dc_hwts_on(void) {
   static int v = -1;
   if (v < 0) {
     const char* e = getenv("DC_HWTS");
@@ -243,6 +278,7 @@ __attribute__((visibility("default"))) struct ibv_cq* ibv_create_cq(
     dc_real_create_cq =
         (struct ibv_cq * (*)(struct ibv_context*, int, void*, struct ibv_comp_channel*, int))
             dlvsym(RTLD_NEXT, "ibv_create_cq", "IBVERBS_1.1");
+  dc_cq_total++;
   if (!dc_hwts_on())  // opt-out of HW-ts -> native passthrough
     return dc_real_create_cq ? dc_real_create_cq(context, cqe, cq_context, channel, comp_vector)
                              : nullptr;
@@ -256,10 +292,21 @@ __attribute__((visibility("default"))) struct ibv_cq* ibv_create_cq(
   attr.wc_flags = IBV_WC_STANDARD_FLAGS | IBV_WC_EX_WITH_COMPLETION_TIMESTAMP_WALLCLOCK;
 
   struct ibv_cq_ex* cqx = ibv_create_cq_ex(context, &attr);  // inline -> provider verbs-context op
-  if (!cqx) {  // device lacks timestamped CQ support -> fall back so we never break the app
-    dc_wallclock = 0;
-    return dc_real_create_cq ? dc_real_create_cq(context, cqe, cq_context, channel, comp_vector)
-                             : nullptr;
+  if (!cqx) {
+    // WALLCLOCK unsupported on this context -> DEGRADE, don't give up: a raw (free-running device)
+    // completion timestamp still gives exact same-CQ deltas, which is most of the value. Only if that
+    // also fails do we hand back a plain CQ -- and then we must NOT hijack poll (dc_poll_cq would read
+    // a non-extended CQ as extended and deref garbage), so capture for this CQ is genuinely zero.
+    attr.wc_flags = IBV_WC_STANDARD_FLAGS | IBV_WC_EX_WITH_COMPLETION_TIMESTAMP;
+    cqx = ibv_create_cq_ex(context, &attr);
+    if (cqx) {
+      dc_wallclock = 0;  // hw_ns is now a raw device tick, not wallclock ns
+    } else {
+      dc_cq_fallback++;
+      dc_wallclock = 0;
+      return dc_real_create_cq ? dc_real_create_cq(context, cqe, cq_context, channel, comp_vector)
+                               : nullptr;
+    }
   }
   if (!dc_orig_poll_cq) dc_orig_poll_cq = context->ops.poll_cq;  // save real provider poll once
   context->ops.poll_cq = dc_poll_cq;  // the app's inlined ibv_poll_cq dispatches here
@@ -267,6 +314,7 @@ __attribute__((visibility("default"))) struct ibv_cq* ibv_create_cq(
   context->ops.post_send = dc_post_send;
   struct ibv_cq* ret = ibv_cq_ex_to_cq(cqx);
   dc_our_cqs.insert(ret);
+  dc_cq_captured++;
   return ret;
 }
 

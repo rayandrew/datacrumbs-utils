@@ -99,6 +99,7 @@ static unsigned long long dc_cq_fallback = 0;   // upgrade failed -> plain CQ, N
 static unsigned long long dc_completions = 0;   // completions actually self-emitted
 // hook ENTRY counts (not emits): distinguishes "our hook never ran" from "it ran but did not emit".
 static unsigned long long dc_n_pollcq = 0, dc_n_startpoll = 0, dc_n_nextpoll = 0, dc_n_postsend = 0;
+static unsigned long long dc_n_wrsend = 0;  // ibv_wr_* send posts (see the send-post hook)
 static int dc_hwts_on(void);  // fwd decl (defined with the CQ interposition below)
 // imm/qp_num: wire-observable join keys read from the completion (no app change). imm is valid on
 // recv-with-immediate only (tag=imm&0xFF, slot=imm>>8); qp_num separates QPs/legs.
@@ -124,8 +125,9 @@ __attribute__((destructor)) static void dc_emit_report(void) {
             dc_emit_count, dc_post_imm, dc_completions, dc_cq_total, dc_cq_captured, dc_cq_fallback,
             getpid());
   if (getenv("DC_DEBUG"))
-    fprintf(stderr, "[dc-client] hook entries: poll_cq=%llu start_poll=%llu next_poll=%llu post_send=%llu\n",
-            dc_n_pollcq, dc_n_startpoll, dc_n_nextpoll, dc_n_postsend);
+    fprintf(stderr, "[dc-client] hook entries: poll_cq=%llu start_poll=%llu next_poll=%llu "
+            "post_send=%llu wr_send=%llu\n",
+            dc_n_pollcq, dc_n_startpoll, dc_n_nextpoll, dc_n_postsend, dc_n_wrsend);
   // ALWAYS warn (not DC_DEBUG-gated): zero capture must never look like "no traffic".
   // The worst case is dc_cq_total == 0: we were asked to capture RDMA and never even saw a CQ created,
   // i.e. the app builds its CQ through an API we do not hook. NB ibv_create_cq_ex is a static inline
@@ -339,10 +341,16 @@ static int dc_registry_json(char* out, size_t cap, const char* prefix, long tid)
                    "%s{\"ph\":\"M\",\"name\":\"datacrumbs.clock_registry\",\"pid\":%d,"
                    "\"tid\":%ld,\"args\":{\"valid\":%d,\"ref_id\":%u,\"self_id\":%u,"
                    "\"synced_phc\":%d,\"anchor_phc_ns\":%lld,\"offset_ns\":%lld,"
-                   "\"skew_ppb\":%lld,\"residual_ns\":%.0f,\"clocks\":[",
+                   "\"skew_ppb\":%lld,\"residual_ns\":%.0f,"
+                   // CPU-clock bridge. Without these two a consumer can align hw-tier events but NOT
+                   // cpu-tier ones (send posts, any uprobe-style event): the registry described the
+                   // NIC clocks and silently omitted the one the CPU stamps with. Discovered when the
+                   // send-post hook made producer-departure capturable and nothing could place it.
+                   "\"rt_minus_mono_ns\":%lld,\"bridge_mono_to_phc_ns\":%lld,\"clocks\":[",
                    prefix, getpid(), tid, dc_cm.valid, dc_cm.ref_id, dc_cm.self_id, dc_cm.synced_phc,
                    (long long)dc_cm.anchor_phc_ns, (long long)dc_cm.offset_ns,
-                   (long long)dc_cm.skew_ppb, dc_cm.residual_rms_ns);
+                   (long long)dc_cm.skew_ppb, dc_cm.residual_rms_ns,
+                   (long long)dc_cm.rt_minus_mono, (long long)dc_cm.bridge_mono_to_phc_ns);
   for (int i = 0; i < dc_cm.n_clocks && o < (int)cap - 128; i++)
     o += snprintf(out + o, cap - o, "%s{\"phc\":%d,\"delta_to_synced_ns\":%lld}",
                   i ? "," : "", dc_cm.phc_id[i], (long long)dc_cm.phc_delta[i]);
@@ -743,6 +751,72 @@ static struct ibv_cq_ex* dc_create_cq_ex(struct ibv_context* context,
 // opened through more than one entry point and we must cover them all: perftest/ib_send_lat opens via
 // mlx5dv_open_device (direct verbs), so hooking only ibv_open_device left it completely uncaptured
 // (measured: cq total=0).
+// ---- send-POST capture: the head of the producer->consumer chain ----
+// Without this the producer side is half-captured. An RC SEND completion is ACK-timed, so the only
+// producer event we had fires ~2.7 us AFTER the consumer's RECV (measured, 20000/20000 messages) --
+// i.e. the captures contained the ACK return leg but NOT the outbound wire, and producer->consumer
+// time was simply not derivable.
+//
+// Two reasons the old ibv_post_send interposition never saw these sends:
+//   * perftest and friends use the ibv_wr_* API ("ibv_wr* API : ON"), whose inlines dispatch through
+//     function pointers ON THE QP, never through context->ops.post_send (measured: post_send=0 hook
+//     entries across a whole run);
+//   * the post marker was only emitted for *_WITH_IMM opcodes, and a plain SEND carries no immediate.
+// So hook the QP's own wr_send/wr_send_imm, and mark EVERY send.
+//
+// The emit lands in the app's send path (~0.3 us), so this is opt-in via DC_HWTS_POSTHOOK and must be
+// validated against an untraced baseline before any number from it is trusted -- same rule as the poll
+// hook, which broke an app the last time that rule was skipped.
+static int dc_posthook_on(void) {
+  static int v = -1;
+  if (v < 0) {
+    const char* e = getenv("DC_HWTS_POSTHOOK");
+    v = (e && *e && e[0] != '0') ? 1 : 0;
+  }
+  return v;
+}
+static void (*dc_orig_wr_send)(struct ibv_qp_ex*) = nullptr;
+static void (*dc_orig_wr_send_imm)(struct ibv_qp_ex*, __be32) = nullptr;
+
+// wr_id is set by the caller on the QP before it calls ibv_wr_send(), so it is readable here and gives
+// the same join key the completion carries. Emitted AFTER the provider builds the WQE: that is the
+// moment the app has finished handing the message over. NB the doorbell rings at wr_complete(), so for
+// a batch this marks WQE build, not the hardware post -- for one-WR-per-iteration senders they coincide.
+static void dc_wr_send(struct ibv_qp_ex* qpx) {
+  dc_orig_wr_send(qpx);
+  dc_n_wrsend++;
+  dc_hwts_emit(0, qpx->wr_id, 250, 0, qpx->qp_base.qp_num, -1, "cpu");
+}
+static void dc_wr_send_imm(struct ibv_qp_ex* qpx, __be32 imm) {
+  dc_orig_wr_send_imm(qpx, imm);
+  dc_n_wrsend++;
+  dc_hwts_emit(0, qpx->wr_id, 250, ntohl(imm), qpx->qp_base.qp_num, -1, "cpu");
+}
+
+static struct ibv_qp* (*dc_orig_create_qp_ex)(struct ibv_context*,
+                                              struct ibv_qp_init_attr_ex*) = nullptr;
+static struct ibv_qp* dc_create_qp_ex(struct ibv_context* context,
+                                      struct ibv_qp_init_attr_ex* attr) {
+  struct ibv_qp* qp = dc_orig_create_qp_ex ? dc_orig_create_qp_ex(context, attr) : nullptr;
+  if (!qp || !dc_hwts_on() || !dc_posthook_on()) return qp;
+  // Only a QP created with SEND_OPS_FLAGS carries the wr_* pointers; touching them otherwise would
+  // dereference whatever happens to sit at that offset.
+  if (!attr || !(attr->comp_mask & IBV_QP_INIT_ATTR_SEND_OPS_FLAGS)) return qp;
+  struct ibv_qp_ex* qpx = ibv_qp_to_qp_ex(qp);
+  if (!qpx) return qp;
+  if (qpx->wr_send) {
+    if (!dc_orig_wr_send) dc_orig_wr_send = qpx->wr_send;
+    if (qpx->wr_send == dc_orig_wr_send) qpx->wr_send = dc_wr_send;
+  }
+  if (qpx->wr_send_imm) {
+    if (!dc_orig_wr_send_imm) dc_orig_wr_send_imm = qpx->wr_send_imm;
+    if (qpx->wr_send_imm == dc_orig_wr_send_imm) qpx->wr_send_imm = dc_wr_send_imm;
+  }
+  if (getenv("DC_DEBUG"))
+    fprintf(stderr, "[dc-client] post-hook installed on qp %u\n", qp->qp_num);
+  return qp;
+}
+
 static void dc_hook_context(struct ibv_context* ctx, const char* via) {
   if (!ctx || !dc_hwts_on() || dc_opshook_level() <= 0) return;
   struct verbs_context* vctx = verbs_get_ctx_op(ctx, create_cq_ex);
@@ -752,6 +826,13 @@ static void dc_hook_context(struct ibv_context* ctx, const char* via) {
   if (!vctx) return;
   if (!dc_orig_create_cq_ex) dc_orig_create_cq_ex = vctx->create_cq_ex;
   vctx->create_cq_ex = dc_create_cq_ex;
+  if (dc_posthook_on()) {
+    struct verbs_context* qctx = verbs_get_ctx_op(ctx, create_qp_ex);
+    if (qctx) {
+      if (!dc_orig_create_qp_ex) dc_orig_create_qp_ex = qctx->create_qp_ex;
+      qctx->create_qp_ex = dc_create_qp_ex;
+    }
+  }
 }
 
 // ON by default (DC_HWTS_OPSHOOK=0 disables). Hooks the ops table so we also catch the inline

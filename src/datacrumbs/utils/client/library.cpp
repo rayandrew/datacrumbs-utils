@@ -259,6 +259,31 @@ static int dc_fmt_pfw() {
 // gettid() is a SYSCALL and the .pfw line used to call it per event, on the same busy-poll thread that
 // is draining the data plane. It is invariant per thread -- cache it. (Measured: the .pfw emit path cost
 // 4.2x the CSV path; this and the oversized line were the difference.)
+// Same story as gettid: modern glibc dropped its getpid() cache, so the .pfw line paid a SECOND
+// syscall per event. Both are invariant for the life of the process/thread.
+static int dc_pid_cached = 0;
+static inline int dc_pid() {
+  if (!dc_pid_cached) dc_pid_cached = getpid();
+  return dc_pid_cached;
+}
+// Hand-rolled unsigned formatting. snprintf with a 12-argument format string has to parse that format
+// on every completion; this is the hot path of a busy-poll data plane, and it is why the .pfw emit was
+// ~9x costlier than CSV and pushed the artifact format the wrong way.
+static inline char* dc_u64(char* p, uint64_t v) {
+  char t[20];
+  int n = 0;
+  do { t[n++] = (char)('0' + (v % 10)); v /= 10; } while (v);
+  while (n) *p++ = t[--n];
+  return p;
+}
+// Byte loop, NOT memcpy: the literals are 8-20 bytes and there are ~14 of them per event, so memcpy
+// here meant 14 libc calls per completion -- a profile of the traced consumer put 25.9% of its time in
+// libc while dc_hwts_emit itself was 2.1%. With a constant size the compiler unrolls this into stores.
+#define DC_LIT(p, lit)                                        \
+  do {                                                        \
+    const char* _s = (lit);                                   \
+    for (size_t _i = 0; _i < sizeof(lit) - 1; _i++) *p++ = _s[_i]; \
+  } while (0)
 static thread_local long dc_tid_cached = 0;
 static inline long dc_tid() {
   if (!dc_tid_cached) dc_tid_cached = (long)syscall(SYS_gettid);
@@ -272,7 +297,7 @@ static int dc_flush_n() {
   static int v = -1;
   if (v < 0) {
     const char* e = getenv("DC_HWTS_FLUSH_N");
-    v = (e && *e) ? atoi(e) : 256;
+    v = (e && *e) ? atoi(e) : 128;  // 128 measured best; 256 was notably worse on the .pfw path
     if (v < 1) v = 1;
   }
   return v;
@@ -369,6 +394,8 @@ static void dc_hwts_emit(uint64_t hw, uint64_t wr_id, uint32_t op, uint32_t imm,
       (void)w;
     }
   }
+  // reserve room for the longest possible record before formatting in place
+  if (s->len + 512 >= sizeof(s->buf)) dc_sink_flush(s);
   struct timespec t;
   clock_gettime(CLOCK_REALTIME, &t);
   uint64_t cpu = (uint64_t)t.tv_sec * 1000000000ull + t.tv_nsec;
@@ -382,14 +409,35 @@ static void dc_hwts_emit(uint64_t hw, uint64_t wr_id, uint32_t op, uint32_t imm,
     // its clock kept in args so the mapping stays auditable/reversible. ref=0 => we could not place
     // it; emit ts=0 and say so rather than silently produce a plausible-but-wrong time.
     uint64_t ref = dc_to_ref_ns(hw ? hw : cpu, hw ? phc : -1);
-    k = snprintf(s->buf + s->len, sizeof(s->buf) - s->len,
-                 "{\"name\":\"rdma_%s\",\"cat\":\"rdma_hwts\",\"ph\":\"X\",\"ts\":%llu,"
-                 "\"dur\":0,\"pid\":%d,\"tid\":%ld,\"args\":{\"aligned\":%d,\"raw_ns\":%llu,"
-                 "\"cpu_ns\":%llu,\"phc\":%d,\"tier\":\"%s\",\"wr_id\":%llu,\"opcode\":%u,"
-                 "\"imm\":%u,\"qp\":%u}}\n",
-                 (op == 250) ? "post" : "completion", (unsigned long long)(ref / 1000), getpid(),
-                 dc_tid(), ref ? 1 : 0, (unsigned long long)(hw ? hw : cpu),
-                 (unsigned long long)cpu, phc, tier, (unsigned long long)wr_id, op, imm, qp);
+    char* p = s->buf + s->len;
+    DC_LIT(p, "{\"name\":\"rdma_");
+    if (op == 250) DC_LIT(p, "post"); else DC_LIT(p, "completion");
+    DC_LIT(p, "\",\"cat\":\"rdma_hwts\",\"ph\":\"X\",\"ts\":");
+    p = dc_u64(p, ref / 1000);
+    DC_LIT(p, ",\"dur\":0,\"pid\":");
+    p = dc_u64(p, (uint64_t)dc_pid());
+    DC_LIT(p, ",\"tid\":");
+    p = dc_u64(p, (uint64_t)dc_tid());
+    DC_LIT(p, ",\"args\":{\"aligned\":");
+    *p++ = ref ? '1' : '0';
+    DC_LIT(p, ",\"raw_ns\":");
+    p = dc_u64(p, hw ? hw : cpu);
+    DC_LIT(p, ",\"cpu_ns\":");
+    p = dc_u64(p, cpu);
+    DC_LIT(p, ",\"phc\":");
+    if (phc < 0) { *p++ = '-'; p = dc_u64(p, (uint64_t)(-phc)); } else p = dc_u64(p, (uint64_t)phc);
+    DC_LIT(p, ",\"tier\":\"");
+    size_t tl = strlen(tier); memcpy(p, tier, tl); p += tl;
+    DC_LIT(p, "\",\"wr_id\":");
+    p = dc_u64(p, wr_id);
+    DC_LIT(p, ",\"opcode\":");
+    p = dc_u64(p, op);
+    DC_LIT(p, ",\"imm\":");
+    p = dc_u64(p, imm);
+    DC_LIT(p, ",\"qp\":");
+    p = dc_u64(p, qp);
+    DC_LIT(p, "}}\n");
+    k = (int)(p - (s->buf + s->len));
   }
   if (k > 0) s->len += (size_t)k;
   dc_completions++;

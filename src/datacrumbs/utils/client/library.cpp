@@ -45,6 +45,7 @@
 #include <datacrumbs/datacrumbs_utils_config.h>
 #include <datacrumbs/utils/client/library.h>
 
+#include <stddef.h>
 #include <sys/mman.h>
 
 /**
@@ -472,6 +473,87 @@ static int dc_poll_cq(struct ibv_cq* cq, int ne, struct ibv_wc* wc) {
   return i;
 }
 
+// ---- ops-table hook: catch the INLINE ibv_create_cq_ex ----
+// ibv_create_cq_ex is a static inline in verbs.h dispatching through verbs_context->create_cq_ex, so
+// it exports NO symbol and LD_PRELOAD can never see it (measured: a program using it yields
+// cq total=0 and zero capture -- exactly the ib_send_lat failure). The only hook point is the ops
+// table, reachable once we own the context -> we interpose ibv_open_device below.
+static struct ibv_cq_ex* (*dc_orig_create_cq_ex)(struct ibv_context*,
+                                                 struct ibv_cq_init_attr_ex*) = nullptr;
+// Our own legacy ibv_create_cq calls ibv_create_cq_ex internally; without this guard that call would
+// re-enter dc_create_cq_ex and register/flag the CQ twice.
+static thread_local int dc_in_legacy_create = 0;
+
+static struct ibv_cq_ex* dc_create_cq_ex(struct ibv_context* context,
+                                         struct ibv_cq_init_attr_ex* attr) {
+  if (!dc_orig_create_cq_ex) return nullptr;
+  if (dc_in_legacy_create || !dc_hwts_on() || !attr) return dc_orig_create_cq_ex(context, attr);
+  dc_cq_total++;
+  const uint64_t caller_flags = attr->wc_flags;  // ADD timestamps to what the app asked for
+  attr->wc_flags = caller_flags | IBV_WC_STANDARD_FLAGS |
+                   IBV_WC_EX_WITH_COMPLETION_TIMESTAMP_WALLCLOCK;
+  struct ibv_cq_ex* cqx = dc_orig_create_cq_ex(context, attr);
+  if (!cqx) {  // degrade to a raw device tick before giving up (same policy as the legacy path)
+    attr->wc_flags = caller_flags | IBV_WC_STANDARD_FLAGS | IBV_WC_EX_WITH_COMPLETION_TIMESTAMP;
+    cqx = dc_orig_create_cq_ex(context, attr);
+    if (cqx) dc_wallclock = 0;
+  }
+  if (!cqx) {  // device refuses timestamps -> honour the app's original request, capture nothing
+    attr->wc_flags = caller_flags;
+    dc_cq_fallback++;
+    return dc_orig_create_cq_ex(context, attr);
+  }
+  attr->wc_flags = caller_flags;  // never leave the caller's struct mutated
+  if (!dc_orig_poll_cq) dc_orig_poll_cq = context->ops.poll_cq;
+  context->ops.poll_cq = dc_poll_cq;
+  if (!dc_orig_post_send) dc_orig_post_send = context->ops.post_send;
+  context->ops.post_send = dc_post_send;
+  dc_our_cqs.emplace(ibv_cq_ex_to_cq(cqx), dc_phc_of_context(context));
+  dc_cq_captured++;
+  return cqx;
+}
+
+// Interpose device open purely to get the context, then own its extended-ops table. This is the
+// generic hook: it covers the inline create_cq_ex and anything else dispatched through verbs_context,
+// so coverage stops depending on which CQ API an app happens to use.
+__attribute__((visibility("default"))) struct ibv_context* ibv_open_device(
+    struct ibv_device* device) {
+  static struct ibv_context* (*real_open)(struct ibv_device*) = nullptr;
+  if (!real_open) {
+    real_open = (struct ibv_context* (*)(struct ibv_device*))dlvsym(RTLD_NEXT, "ibv_open_device",
+                                                                   "IBVERBS_1.1");
+    if (!real_open)
+      real_open = (struct ibv_context* (*)(struct ibv_device*))dlsym(RTLD_NEXT, "ibv_open_device");
+  }
+  if (!real_open) return nullptr;
+  struct ibv_context* ctx = real_open(device);
+  // OPT-IN (DC_HWTS_OPSHOOK=1). Writing into libibverbs' verbs_context is materially riskier than the
+  // legacy symbol interposition: get it wrong and we corrupt the traced application rather than merely
+  // failing to capture. Observed doing exactly that -- with the hook on, a create_cq_ex CQ builds fine
+  // and ibv_create_qp succeeds, then ibv_modify_qp segfaults. Layout is NOT the cause (runtime sz=656
+  // == our sizeof, create_cq_ex at +200), so the fault is still unexplained -> stays off by default
+  // until it is understood. A tracer must never break the thing it observes.
+  static int opshook = -1;
+  if (opshook < 0) {
+    const char* e = getenv("DC_HWTS_OPSHOOK");
+    opshook = (e && *e && e[0] != '0') ? 1 : 0;
+  }
+  if (ctx && dc_hwts_on() && opshook) {
+    struct verbs_context* vctx = verbs_get_ctx_op(ctx, create_cq_ex);
+    if (getenv("DC_DEBUG"))
+      fprintf(stderr,
+              "[dc-client] ops-hook: vctx=%p sz=%zu our_sizeof=%zu off(create_cq_ex)=%zu orig=%p\n",
+              (void*)vctx, vctx ? (size_t)vctx->sz : (size_t)0, sizeof(struct verbs_context),
+              offsetof(struct verbs_context, create_cq_ex),
+              vctx ? (void*)(uintptr_t)vctx->create_cq_ex : nullptr);
+    if (vctx) {
+      if (!dc_orig_create_cq_ex) dc_orig_create_cq_ex = vctx->create_cq_ex;
+      vctx->create_cq_ex = dc_create_cq_ex;
+    }
+  }
+  return ctx;
+}
+
 // intercept the (versioned) legacy ibv_create_cq -> timestamped extended CQ + hijack poll dispatch.
 __attribute__((visibility("default"))) struct ibv_cq* ibv_create_cq(
     struct ibv_context* context, int cqe, void* cq_context, struct ibv_comp_channel* channel,
@@ -493,6 +575,8 @@ __attribute__((visibility("default"))) struct ibv_cq* ibv_create_cq(
   attr.comp_vector = comp_vector;
   attr.wc_flags = IBV_WC_STANDARD_FLAGS | IBV_WC_EX_WITH_COMPLETION_TIMESTAMP_WALLCLOCK;
 
+  // guard: this inline now dispatches through our own dc_create_cq_ex hook -- pass it through
+  dc_in_legacy_create = 1;
   struct ibv_cq_ex* cqx = ibv_create_cq_ex(context, &attr);  // inline -> provider verbs-context op
   if (!cqx) {
     // WALLCLOCK unsupported on this context -> DEGRADE, don't give up: a raw (free-running device)
@@ -506,6 +590,7 @@ __attribute__((visibility("default"))) struct ibv_cq* ibv_create_cq(
     } else {
       dc_cq_fallback++;
       dc_wallclock = 0;
+      dc_in_legacy_create = 0;
       return dc_real_create_cq ? dc_real_create_cq(context, cqe, cq_context, channel, comp_vector)
                                : nullptr;
     }
@@ -517,6 +602,7 @@ __attribute__((visibility("default"))) struct ibv_cq* ibv_create_cq(
   struct ibv_cq* ret = ibv_cq_ex_to_cq(cqx);
   dc_our_cqs.emplace(ret, dc_phc_of_context(context));
   dc_cq_captured++;
+  dc_in_legacy_create = 0;
   return ret;
 }
 

@@ -40,9 +40,12 @@
 /**
  * Internal headers
  */
+#include <datacrumbs/common/dc_timesync_snapshot.h>
 #include <datacrumbs/common/logging.h>
 #include <datacrumbs/datacrumbs_utils_config.h>
 #include <datacrumbs/utils/client/library.h>
+
+#include <sys/mman.h>
 
 /**
  * @brief Called when the library is loaded.
@@ -141,6 +144,99 @@ __attribute__((destructor)) static void dc_emit_report(void) {
             dc_cq_fallback, dc_cq_total, getpid());
 }
 
+// ---- timesync clock registry: put our timestamps on the REFERENCE timeline ----
+// Read once from the dc_timesync seqlock snapshot. This is what lets the client emit real trace
+// events instead of an out-of-band CSV that someone has to align by hand later (that hand step is
+// where a stale offset once produced 100% causality violations). We keep the RAW value in args too,
+// so a bad fit can always be re-derived -- remapping must never destroy the original measurement.
+struct dc_clockmap {
+  int valid = 0;
+  int synced_phc = -1;
+  int n_clocks = 0;
+  int phc_id[DC_TIMESYNC_MAX_CLOCKS];
+  int64_t phc_delta[DC_TIMESYNC_MAX_CLOCKS];
+  int64_t bridge_mono_to_phc_ns = 0, anchor_phc_ns = 0, offset_ns = 0, skew_ppb = 0;
+  int64_t rt_minus_mono = 0;  // local CLOCK_REALTIME - CLOCK_MONOTONIC, for cpu-tier events
+  uint32_t ref_id = 0, self_id = 0;
+  double residual_rms_ns = 0;
+};
+static dc_clockmap dc_cm;
+static int dc_cm_loaded = 0;
+
+static void dc_load_clockmap() {
+  const char* p = getenv("DC_TIMESYNC_SNAPSHOT");
+  if (!p || !*p) p = DC_TIMESYNC_DEFAULT_PATH;
+  int fd = open(p, O_RDONLY);
+  if (fd >= 0) {
+    void* m = mmap(nullptr, sizeof(struct dc_timesync_snapshot), PROT_READ, MAP_SHARED, fd, 0);
+    close(fd);
+    if (m != MAP_FAILED) {
+      volatile struct dc_timesync_snapshot* s = (struct dc_timesync_snapshot*)m;
+      for (int t = 0; t < 8; t++) {  // seqlock: retry while a write is in progress
+        uint32_t a = __atomic_load_n((uint32_t*)&s->seq, __ATOMIC_ACQUIRE);
+        if (a & 1u) continue;
+        dc_cm.ref_id = s->ref_id;
+        dc_cm.self_id = s->self_id;
+        dc_cm.bridge_mono_to_phc_ns = s->bridge_mono_to_phc_ns;
+        dc_cm.anchor_phc_ns = s->anchor_phc_ns;
+        dc_cm.offset_ns = s->offset_ns;
+        dc_cm.skew_ppb = s->skew_ppb;
+        dc_cm.residual_rms_ns = s->residual_rms_ns;
+        dc_cm.synced_phc = (s->version >= 2) ? s->synced_phc_index : -1;
+        dc_cm.n_clocks = 0;
+        if (s->version >= 2)
+          for (uint32_t i = 0; i < s->n_clocks && i < DC_TIMESYNC_MAX_CLOCKS; i++)
+            if (s->clocks[i].valid) {
+              dc_cm.phc_id[dc_cm.n_clocks] = s->clocks[i].phc_index;
+              dc_cm.phc_delta[dc_cm.n_clocks] = s->clocks[i].delta_to_synced_ns;
+              dc_cm.n_clocks++;
+            }
+        uint32_t b = __atomic_load_n((uint32_t*)&s->seq, __ATOMIC_ACQUIRE);
+        if (a == b && s->magic == DC_TIMESYNC_MAGIC && s->valid) dc_cm.valid = 1;
+        if (a == b) break;
+      }
+      munmap(m, sizeof(struct dc_timesync_snapshot));
+    }
+  }
+  struct timespec rt, mo;
+  clock_gettime(CLOCK_REALTIME, &rt);
+  clock_gettime(CLOCK_MONOTONIC, &mo);
+  dc_cm.rt_minus_mono = (int64_t)((uint64_t)rt.tv_sec * 1000000000ull + rt.tv_nsec) -
+                        (int64_t)((uint64_t)mo.tv_sec * 1000000000ull + mo.tv_nsec);
+}
+
+// Map a local timestamp onto the reference timeline. phc >= 0: t is a NIC hw ts on that PHC.
+// phc < 0: t is CLOCK_REALTIME (the cpu-tier post markers). Returns 0 if we cannot place it --
+// callers must then NOT pretend the event is aligned.
+static uint64_t dc_to_ref_ns(uint64_t t, int phc) {
+  if (!dc_cm.valid) return 0;
+  int64_t synced;
+  if (phc >= 0) {
+    int found = 0;
+    int64_t d = 0;
+    for (int i = 0; i < dc_cm.n_clocks; i++)
+      if (dc_cm.phc_id[i] == phc) { d = dc_cm.phc_delta[i]; found = 1; break; }
+    if (!found) return 0;  // unknown clock -> refuse rather than emit a 20 s lie
+    synced = (int64_t)t + d;
+  } else {  // REALTIME -> MONOTONIC -> local synced PHC
+    synced = ((int64_t)t - dc_cm.rt_minus_mono) + dc_cm.bridge_mono_to_phc_ns;
+  }
+  double drift = (double)dc_cm.skew_ppb * (double)(synced - dc_cm.anchor_phc_ns) / 1e9;
+  return (uint64_t)(synced + dc_cm.offset_ns + (int64_t)drift);
+}
+
+// pfw (in-trace) by default; DC_HWTS_FORMAT=csv keeps the compact sink for firehose-rate paths
+// (the DDS data plane emits ~3.9M completions -- as JSON that is ~4x the bytes and would bury the
+// few thousand uprobe events you actually want to look at).
+static int dc_fmt_pfw() {
+  static int v = -1;
+  if (v < 0) {
+    const char* e = getenv("DC_HWTS_FORMAT");
+    v = (e && !strcmp(e, "csv")) ? 0 : 1;
+  }
+  return v;
+}
+
 // ---- client-side hardware-timestamp sink (per-thread, lock-free, periodically flushed) ----
 // The server-uprobed datacrumbs_rdma_completion above traps the kernel PER COMPLETION; on a busy-poll
 // SPDK reactor draining the DDS bulk data plane that DEADLOCKS the backend. So by default the client
@@ -191,22 +287,61 @@ static void dc_hwts_emit(uint64_t hw, uint64_t wr_id, uint32_t op, uint32_t imm,
     if (!dir || !*dir) dir = "/tmp";
     char path[512];
     long tid = (long)syscall(SYS_gettid);
-    snprintf(path, sizeof(path), "%s/dc_hwts_%d_%ld.csv", dir, getpid(), tid);
+    if (!dc_cm_loaded) { dc_cm_loaded = 1; dc_load_clockmap(); }
+    snprintf(path, sizeof(path), "%s/dc_hwts_%d_%ld.%s", dir, getpid(), tid,
+             dc_fmt_pfw() ? "pfw" : "csv");
     s->fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (s->fd < 0) {
       s->fd = -2;
       return;
     }
-    const char* hdr = "cpu_ns,hw_ns,wr_id,opcode,imm,qp_num,phc,tier\n";
-    ssize_t w = write(s->fd, hdr, strlen(hdr));
-    (void)w;
+    if (!dc_fmt_pfw()) {
+      const char* hdr = "cpu_ns,hw_ns,wr_id,opcode,imm,qp_num,phc,tier\n";
+      ssize_t w = write(s->fd, hdr, strlen(hdr));
+      (void)w;
+    } else {
+      // Chrome-trace stream + a ph:"M" metadata event carrying the whole clock registry, so the
+      // trace is SELF-DESCRIBING: any consumer can (re)align it with no external state, no snapshot
+      // file, and no per-run offset pasted into a script.
+      char hdr[2048];
+      int o = snprintf(hdr, sizeof(hdr),
+                       "[\n{\"ph\":\"M\",\"name\":\"datacrumbs.clock_registry\",\"pid\":%d,"
+                       "\"tid\":%ld,\"args\":{\"valid\":%d,\"ref_id\":%u,\"self_id\":%u,"
+                       "\"synced_phc\":%d,\"anchor_phc_ns\":%lld,\"offset_ns\":%lld,"
+                       "\"skew_ppb\":%lld,\"residual_ns\":%.0f,\"clocks\":[",
+                       getpid(), tid, dc_cm.valid, dc_cm.ref_id, dc_cm.self_id, dc_cm.synced_phc,
+                       (long long)dc_cm.anchor_phc_ns, (long long)dc_cm.offset_ns,
+                       (long long)dc_cm.skew_ppb, dc_cm.residual_rms_ns);
+      for (int i = 0; i < dc_cm.n_clocks && o < (int)sizeof(hdr) - 128; i++)
+        o += snprintf(hdr + o, sizeof(hdr) - o, "%s{\"phc\":%d,\"delta_to_synced_ns\":%lld}",
+                      i ? "," : "", dc_cm.phc_id[i], (long long)dc_cm.phc_delta[i]);
+      o += snprintf(hdr + o, sizeof(hdr) - o, "]}}\n");
+      ssize_t w = write(s->fd, hdr, o);
+      (void)w;
+    }
   }
   struct timespec t;
   clock_gettime(CLOCK_REALTIME, &t);
   uint64_t cpu = (uint64_t)t.tv_sec * 1000000000ull + t.tv_nsec;
-  int k = snprintf(s->buf + s->len, sizeof(s->buf) - s->len, "%llu,%llu,%llu,%u,%u,%u,%d,%s\n",
-                   (unsigned long long)cpu, (unsigned long long)hw, (unsigned long long)wr_id, op,
-                   imm, qp, phc, tier);
+  int k;
+  if (!dc_fmt_pfw()) {
+    k = snprintf(s->buf + s->len, sizeof(s->buf) - s->len, "%llu,%llu,%llu,%u,%u,%u,%d,%s\n",
+                 (unsigned long long)cpu, (unsigned long long)hw, (unsigned long long)wr_id, op,
+                 imm, qp, phc, tier);
+  } else {
+    // ts on the REFERENCE timeline in us (what every .pfw consumer expects), with the raw value and
+    // its clock kept in args so the mapping stays auditable/reversible. ref=0 => we could not place
+    // it; emit ts=0 and say so rather than silently produce a plausible-but-wrong time.
+    uint64_t ref = dc_to_ref_ns(hw ? hw : cpu, hw ? phc : -1);
+    k = snprintf(s->buf + s->len, sizeof(s->buf) - s->len,
+                 "{\"name\":\"rdma_%s\",\"cat\":\"rdma_hwts\",\"ph\":\"X\",\"ts\":%llu,"
+                 "\"dur\":0,\"pid\":%d,\"tid\":%ld,\"args\":{\"aligned\":%d,\"raw_ns\":%llu,"
+                 "\"cpu_ns\":%llu,\"phc\":%d,\"tier\":\"%s\",\"wr_id\":%llu,\"opcode\":%u,"
+                 "\"imm\":%u,\"qp\":%u}}\n",
+                 (op == 250) ? "post" : "completion", (unsigned long long)(ref / 1000), getpid(),
+                 (long)syscall(SYS_gettid), ref ? 1 : 0, (unsigned long long)(hw ? hw : cpu),
+                 (unsigned long long)cpu, phc, tier, (unsigned long long)wr_id, op, imm, qp);
+  }
   if (k > 0) s->len += (size_t)k;
   dc_completions++;
   if (++s->n % DC_SINK_FLUSH_N == 0 || s->len + 128 >= sizeof(s->buf)) dc_sink_flush(s);

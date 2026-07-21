@@ -312,6 +312,10 @@ struct dc_sink {
   ~dc_sink() {  // clean thread/process exit (e.g. host duckdb) flushes the final tail
     if (fd >= 0) {
       if (len) { ssize_t w = write(fd, buf, len); (void)w; }
+      // Terminate the .pfw stream the way the datacrumbs writer does ("[" ... one object per line ...
+      // "]"). A killed process cannot do this, so readers must tolerate its absence -- but on a clean
+      // exit an unterminated trace is just a malformed one.
+      if (dc_fmt_pfw()) { ssize_t w = write(fd, "]\n", 2); (void)w; }
       close(fd);
     }
   }

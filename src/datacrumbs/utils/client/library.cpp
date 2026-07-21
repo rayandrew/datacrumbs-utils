@@ -94,6 +94,15 @@ static unsigned long long dc_completions = 0;   // completions actually self-emi
 static int dc_hwts_on(void);  // fwd decl (defined with the CQ interposition below)
 // imm/qp_num: wire-observable join keys read from the completion (no app change). imm is valid on
 // recv-with-immediate only (tag=imm&0xFF, slot=imm>>8); qp_num separates QPs/legs.
+//
+// BYTE ORDER -- known asymmetry, mind it when joining the two sides:
+//   * RECV completions carry imm exactly as ibverbs delivers it = NETWORK order (verified: a peer
+//     sending htonl(0,1,2,3) shows up as 0, 16777216, 33554432, 50331648).
+//   * The opcode=250 POST marker carries ntohl(imm) = HOST order (0,1,2,3), because at post time we
+//     read the app's own imm_data field.
+// So a consumer joining sender->receiver on this key MUST ntohl the recv side first (that is what
+// wire_split3.py does). Left as-is deliberately: the recv value is "what was on the wire", and
+// changing it now would silently re-interpret already-validated captures.
 __attribute__((noinline, visibility("default"))) void datacrumbs_rdma_completion(
     uint64_t hw_ns, uint64_t wr_id, uint32_t opcode, uint32_t imm, uint32_t qp_num) {
   __asm__ __volatile__("" ::"r"(hw_ns), "r"(wr_id), "r"(opcode), "r"(imm), "r"(qp_num) : "memory");

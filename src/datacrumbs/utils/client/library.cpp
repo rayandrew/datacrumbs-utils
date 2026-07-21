@@ -422,8 +422,19 @@ static void dc_hwts_emit(uint64_t hw, uint64_t wr_id, uint32_t op, uint32_t imm,
     // it; emit ts=0 and say so rather than silently produce a plausible-but-wrong time.
     uint64_t ref = dc_to_ref_ns(hw ? hw : cpu, hw ? phc : -1);
     char* p = s->buf + s->len;
+    // Name the event by what it IS. Calling every completion "rdma_completion" and hiding the opcode
+    // in args means a viewer cannot tell a send from a receive -- which is the one distinction the
+    // whole producer/consumer story rests on. cat stays "rdma_hwts" so filters keep working.
     DC_LIT(p, "{\"name\":\"rdma_");
-    if (op == 250) DC_LIT(p, "post"); else DC_LIT(p, "completion");
+    switch (op) {
+      case 250: DC_LIT(p, "post"); break;        // send POST (cpu tier), our own marker
+      case IBV_WC_SEND: DC_LIT(p, "send"); break;
+      case IBV_WC_RECV: DC_LIT(p, "recv"); break;
+      case IBV_WC_RECV_RDMA_WITH_IMM: DC_LIT(p, "recv_imm"); break;
+      case IBV_WC_RDMA_WRITE: DC_LIT(p, "write"); break;
+      case IBV_WC_RDMA_READ: DC_LIT(p, "read"); break;
+      default: DC_LIT(p, "completion"); break;   // opcode still in args
+    }
     DC_LIT(p, "\",\"cat\":\"rdma_hwts\",\"ph\":\"X\",\"ts\":");
     p = dc_u64(p, ref / 1000);
     DC_LIT(p, ",\"dur\":0,\"pid\":");

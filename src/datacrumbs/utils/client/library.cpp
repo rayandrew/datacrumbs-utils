@@ -478,6 +478,14 @@ static int dc_poll_cq(struct ibv_cq* cq, int ne, struct ibv_wc* wc) {
 // it exports NO symbol and LD_PRELOAD can never see it (measured: a program using it yields
 // cq total=0 and zero capture -- exactly the ib_send_lat failure). The only hook point is the ops
 // table, reachable once we own the context -> we interpose ibv_open_device below.
+int dc_opshook_level(void) {
+  static int v = -1;
+  if (v < 0) {
+    const char* e = getenv("DC_HWTS_OPSHOOK");
+    v = (e && *e) ? atoi(e) : 1;  // ON by default; DC_HWTS_OPSHOOK=0 disables (escape hatch)
+  }
+  return v;
+}
 static struct ibv_cq_ex* (*dc_orig_create_cq_ex)(struct ibv_context*,
                                                  struct ibv_cq_init_attr_ex*) = nullptr;
 // Our own legacy ibv_create_cq calls ibv_create_cq_ex internally; without this guard that call would
@@ -488,11 +496,21 @@ static struct ibv_cq_ex* dc_create_cq_ex(struct ibv_context* context,
                                          struct ibv_cq_init_attr_ex* attr) {
   if (!dc_orig_create_cq_ex) return nullptr;
   if (dc_in_legacy_create || !dc_hwts_on() || !attr) return dc_orig_create_cq_ex(context, attr);
+  // DC_HWTS_OPSHOOK bisect levels: 2 = pure pass-through (hook installed, we touch nothing),
+  // 3 = timestamp flags only (no ops hijack, no registration), 1 = full.
+  extern int dc_opshook_level(void);
+  int lvl = dc_opshook_level();
+  if (lvl == 2) return dc_orig_create_cq_ex(context, attr);
   dc_cq_total++;
   const uint64_t caller_flags = attr->wc_flags;  // ADD timestamps to what the app asked for
   attr->wc_flags = caller_flags | IBV_WC_STANDARD_FLAGS |
                    IBV_WC_EX_WITH_COMPLETION_TIMESTAMP_WALLCLOCK;
   struct ibv_cq_ex* cqx = dc_orig_create_cq_ex(context, attr);
+  // MUST record which timestamp field this CQ actually carries: dc_poll_cq picks
+  // ibv_wc_read_completion_wallclock_ns() vs ibv_wc_read_completion_ts() from this flag, and reading
+  // the field whose flag was NOT requested at creation is undefined -> it segfaults on the first
+  // poll. (Omitting this line is exactly what crashed the app here; the legacy path sets it too.)
+  if (cqx) dc_wallclock = 1;
   if (!cqx) {  // degrade to a raw device tick before giving up (same policy as the legacy path)
     attr->wc_flags = caller_flags | IBV_WC_STANDARD_FLAGS | IBV_WC_EX_WITH_COMPLETION_TIMESTAMP;
     cqx = dc_orig_create_cq_ex(context, attr);
@@ -504,11 +522,15 @@ static struct ibv_cq_ex* dc_create_cq_ex(struct ibv_context* context,
     return dc_orig_create_cq_ex(context, attr);
   }
   attr->wc_flags = caller_flags;  // never leave the caller's struct mutated
-  if (!dc_orig_poll_cq) dc_orig_poll_cq = context->ops.poll_cq;
-  context->ops.poll_cq = dc_poll_cq;
-  if (!dc_orig_post_send) dc_orig_post_send = context->ops.post_send;
-  context->ops.post_send = dc_post_send;
-  dc_our_cqs.emplace(ibv_cq_ex_to_cq(cqx), dc_phc_of_context(context));
+  if (lvl == 3) return cqx;        // bisect: flags applied, but do not touch ops or register
+  if (lvl != 5) {                  // 5 = register only, no ops hijack
+    if (!dc_orig_poll_cq) dc_orig_poll_cq = context->ops.poll_cq;
+    context->ops.poll_cq = dc_poll_cq;
+    if (!dc_orig_post_send) dc_orig_post_send = context->ops.post_send;
+    context->ops.post_send = dc_post_send;
+  }
+  if (lvl != 4)                    // 4 = ops hijack only, no registration
+    dc_our_cqs.emplace(ibv_cq_ex_to_cq(cqx), dc_phc_of_context(context));
   dc_cq_captured++;
   return cqx;
 }
@@ -527,18 +549,14 @@ __attribute__((visibility("default"))) struct ibv_context* ibv_open_device(
   }
   if (!real_open) return nullptr;
   struct ibv_context* ctx = real_open(device);
-  // OPT-IN (DC_HWTS_OPSHOOK=1). Writing into libibverbs' verbs_context is materially riskier than the
-  // legacy symbol interposition: get it wrong and we corrupt the traced application rather than merely
-  // failing to capture. Observed doing exactly that -- with the hook on, a create_cq_ex CQ builds fine
-  // and ibv_create_qp succeeds, then ibv_modify_qp segfaults. Layout is NOT the cause (runtime sz=656
-  // == our sizeof, create_cq_ex at +200), so the fault is still unexplained -> stays off by default
-  // until it is understood. A tracer must never break the thing it observes.
-  static int opshook = -1;
-  if (opshook < 0) {
-    const char* e = getenv("DC_HWTS_OPSHOOK");
-    opshook = (e && *e && e[0] != '0') ? 1 : 0;
-  }
-  if (ctx && dc_hwts_on() && opshook) {
+  // ON by default (DC_HWTS_OPSHOOK=0 disables). This hooks the ops table so we also catch the inline
+  // ibv_create_cq_ex, which exports no symbol and is otherwise invisible -- without it an app using
+  // that path captures NOTHING (measured: selftest use_cq_ex=1 -> 0 events; with the hook -> 150).
+  // It did segfault the app at first; the cause was ours (dc_wallclock was left 0 so dc_poll_cq read
+  // the wrong timestamp field), not an ABI mismatch -- runtime verbs_context sz==our sizeof. Kept
+  // behind an env switch anyway: writing into libibverbs internals is riskier than symbol
+  // interposition, and a site hitting an ABI difference must be able to turn it off.
+  if (ctx && dc_hwts_on() && dc_opshook_level() > 0) {
     struct verbs_context* vctx = verbs_get_ctx_op(ctx, create_cq_ex);
     if (getenv("DC_DEBUG"))
       fprintf(stderr,

@@ -227,7 +227,21 @@ static int dc_hwts_on(void) {
 // index. Returns -1 if unknown -> the consumer must NOT remap that timestamp.
 static int dc_phc_of_context(struct ibv_context* ctx) {
   if (!ctx || !ctx->device) return -1;
-  const char* dev = ibv_get_device_name(ctx->device);
+  // Resolve ibv_get_device_name through dlvsym like the real ibv_create_cq above. We do NOT link
+  // -libverbs, so a plain call is an unversioned undefined reference against a VERSIONED symbol; that
+  // mis-binds and returns garbage (observed: a "name" pointer of 0x19, which segfaults snprintf).
+  static const char* (*real_get_name)(struct ibv_device*) = nullptr;
+  if (!real_get_name) {
+    real_get_name =
+        (const char* (*)(struct ibv_device*))dlvsym(RTLD_NEXT, "ibv_get_device_name", "IBVERBS_1.1");
+    if (!real_get_name)  // unversioned fallback
+      real_get_name = (const char* (*)(struct ibv_device*))dlsym(RTLD_NEXT, "ibv_get_device_name");
+  }
+  if (!real_get_name) return -1;
+  const char* dev = real_get_name(ctx->device);
+  if (getenv("DC_DEBUG"))
+    fprintf(stderr, "[dc-client] phc-resolve: ctx=%p device=%p name=%s\n", (void*)ctx,
+            (void*)ctx->device, dev ? dev : "(null)");
   if (!dev) return -1;
   char dir[256];
   snprintf(dir, sizeof(dir), "/sys/class/infiniband/%s/device/net", dev);

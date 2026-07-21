@@ -494,6 +494,7 @@ static thread_local int dc_in_legacy_create = 0;
 
 static struct ibv_cq_ex* dc_create_cq_ex(struct ibv_context* context,
                                          struct ibv_cq_init_attr_ex* attr) {
+  if (getenv("DC_DEBUG")) fprintf(stderr, "[dc-client] ENTER dc_create_cq_ex\n");
   if (!dc_orig_create_cq_ex) return nullptr;
   if (dc_in_legacy_create || !dc_hwts_on() || !attr) return dc_orig_create_cq_ex(context, attr);
   // DC_HWTS_OPSHOOK bisect levels: 2 = pure pass-through (hook installed, we touch nothing),
@@ -535,9 +536,23 @@ static struct ibv_cq_ex* dc_create_cq_ex(struct ibv_context* context,
   return cqx;
 }
 
-// Interpose device open purely to get the context, then own its extended-ops table. This is the
-// generic hook: it covers the inline create_cq_ex and anything else dispatched through verbs_context,
-// so coverage stops depending on which CQ API an app happens to use.
+// Install the extended-ops hook on a freshly opened context. Factored out because a device can be
+// opened through more than one entry point and we must cover them all: perftest/ib_send_lat opens via
+// mlx5dv_open_device (direct verbs), so hooking only ibv_open_device left it completely uncaptured
+// (measured: cq total=0).
+static void dc_hook_context(struct ibv_context* ctx, const char* via) {
+  if (!ctx || !dc_hwts_on() || dc_opshook_level() <= 0) return;
+  struct verbs_context* vctx = verbs_get_ctx_op(ctx, create_cq_ex);
+  if (getenv("DC_DEBUG"))
+    fprintf(stderr, "[dc-client] ops-hook via %s: vctx=%p sz=%zu our_sizeof=%zu\n", via, (void*)vctx,
+            vctx ? (size_t)vctx->sz : (size_t)0, sizeof(struct verbs_context));
+  if (!vctx) return;
+  if (!dc_orig_create_cq_ex) dc_orig_create_cq_ex = vctx->create_cq_ex;
+  vctx->create_cq_ex = dc_create_cq_ex;
+}
+
+// ON by default (DC_HWTS_OPSHOOK=0 disables). Hooks the ops table so we also catch the inline
+// ibv_create_cq_ex, which exports no symbol and is otherwise invisible.
 __attribute__((visibility("default"))) struct ibv_context* ibv_open_device(
     struct ibv_device* device) {
   static struct ibv_context* (*real_open)(struct ibv_device*) = nullptr;
@@ -549,26 +564,26 @@ __attribute__((visibility("default"))) struct ibv_context* ibv_open_device(
   }
   if (!real_open) return nullptr;
   struct ibv_context* ctx = real_open(device);
-  // ON by default (DC_HWTS_OPSHOOK=0 disables). This hooks the ops table so we also catch the inline
-  // ibv_create_cq_ex, which exports no symbol and is otherwise invisible -- without it an app using
-  // that path captures NOTHING (measured: selftest use_cq_ex=1 -> 0 events; with the hook -> 150).
-  // It did segfault the app at first; the cause was ours (dc_wallclock was left 0 so dc_poll_cq read
-  // the wrong timestamp field), not an ABI mismatch -- runtime verbs_context sz==our sizeof. Kept
-  // behind an env switch anyway: writing into libibverbs internals is riskier than symbol
-  // interposition, and a site hitting an ABI difference must be able to turn it off.
-  if (ctx && dc_hwts_on() && dc_opshook_level() > 0) {
-    struct verbs_context* vctx = verbs_get_ctx_op(ctx, create_cq_ex);
-    if (getenv("DC_DEBUG"))
-      fprintf(stderr,
-              "[dc-client] ops-hook: vctx=%p sz=%zu our_sizeof=%zu off(create_cq_ex)=%zu orig=%p\n",
-              (void*)vctx, vctx ? (size_t)vctx->sz : (size_t)0, sizeof(struct verbs_context),
-              offsetof(struct verbs_context, create_cq_ex),
-              vctx ? (void*)(uintptr_t)vctx->create_cq_ex : nullptr);
-    if (vctx) {
-      if (!dc_orig_create_cq_ex) dc_orig_create_cq_ex = vctx->create_cq_ex;
-      vctx->create_cq_ex = dc_create_cq_ex;
-    }
+  dc_hook_context(ctx, "ibv_open_device");
+  return ctx;
+}
+
+// mlx5 direct-verbs open. Declared locally (attr as void*) so we do not need mlx5dv.h or a libmlx5
+// link -- we only care about the returned context. If the real symbol is absent the call fails just
+// as it would without us.
+__attribute__((visibility("default"))) struct ibv_context* mlx5dv_open_device(
+    struct ibv_device* device, void* attr) {
+  static struct ibv_context* (*real_open)(struct ibv_device*, void*) = nullptr;
+  if (!real_open) {
+    real_open = (struct ibv_context* (*)(struct ibv_device*, void*))dlvsym(
+        RTLD_NEXT, "mlx5dv_open_device", "MLX5_1.7");
+    if (!real_open)
+      real_open =
+          (struct ibv_context* (*)(struct ibv_device*, void*))dlsym(RTLD_NEXT, "mlx5dv_open_device");
   }
+  if (!real_open) return nullptr;
+  struct ibv_context* ctx = real_open(device, attr);
+  dc_hook_context(ctx, "mlx5dv_open_device");
   return ctx;
 }
 
@@ -580,6 +595,7 @@ __attribute__((visibility("default"))) struct ibv_cq* ibv_create_cq(
     dc_real_create_cq =
         (struct ibv_cq * (*)(struct ibv_context*, int, void*, struct ibv_comp_channel*, int))
             dlvsym(RTLD_NEXT, "ibv_create_cq", "IBVERBS_1.1");
+  if (getenv("DC_DEBUG")) fprintf(stderr, "[dc-client] ENTER ibv_create_cq (legacy)\n");
   dc_cq_total++;
   if (!dc_hwts_on())  // opt-out of HW-ts -> native passthrough
     return dc_real_create_cq ? dc_real_create_cq(context, cqe, cq_context, channel, comp_vector)

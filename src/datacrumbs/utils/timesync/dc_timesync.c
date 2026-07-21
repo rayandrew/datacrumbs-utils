@@ -231,6 +231,47 @@ static int64_t phc_mono_offset(int phc_index, uint64_t* phc_out) {
   return (int64_t)(phc - sys) + rt_minus_mono;  // add to CLOCK_MONOTONIC ns -> PHC ns
 }
 
+// Populate the v2 local clock registry: for every /dev/ptpN on this node, the offset that maps its
+// ns onto the SYNCED PHC's ns (the one the cross-node fit is expressed in). A hw timestamp from any
+// NIC can then be remapped to the reference; without this, a timestamp from another PHC lands ~20 s
+// away (BlueField has 4 independent PHCs and the fit only covers one).
+//
+// Sign: phc_mono_offset() returns (phc - mono), so with t_k = mono + off_k and
+// t_synced = mono + off_synced, we need delta = t_synced - t_k = off_synced - off_k.
+//
+// Accuracy: both reads use PTP_SYS_OFFSET_PRECISE (hardware cross-timestamping), and the PHCs share
+// the NIC oscillator so their relative drift is ~2 ns/s -- over the microseconds between the two
+// ioctls the induced error is sub-ns. Re-reading the synced PHC per entry bounds it further.
+static uint64_t mono_ns(void);  // fwd decl (defined below)
+static void fill_clock_registry(struct dc_timesync_snapshot* v, int synced_phc) {
+  v->synced_phc_index = synced_phc;
+  v->n_clocks = 0;
+  for (int k = 0; k < 64 && v->n_clocks < DC_TIMESYNC_MAX_CLOCKS; k++) {
+    char dev[32];
+    snprintf(dev, sizeof(dev), "/dev/ptp%d", k);
+    if (access(dev, R_OK) != 0) continue;
+    struct dc_timesync_clock* c = &v->clocks[v->n_clocks];
+    c->phc_index = k;
+    c->updated_mono_ns = mono_ns();
+    if (k == synced_phc) {  // identity by definition
+      c->delta_to_synced_ns = 0;
+      c->valid = 1;
+      v->n_clocks++;
+      continue;
+    }
+    int64_t off_synced = phc_mono_offset(synced_phc, NULL);
+    int64_t off_k = phc_mono_offset(k, NULL);
+    if (off_synced == 0 || off_k == 0) {  // unreadable -> mark invalid rather than publish a lie
+      c->delta_to_synced_ns = 0;
+      c->valid = 0;
+    } else {
+      c->delta_to_synced_ns = off_synced - off_k;
+      c->valid = 1;
+    }
+    v->n_clocks++;
+  }
+}
+
 // Handle one responder turn: wait (up to the socket's SO_RCVTIMEO) for a REQ and
 // reply with RESP + a FUP carrying our RX/TX hw timestamps. Returns 1 if a REQ
 // was served, 0 on timeout (lets a caller wake periodically to do other work).
@@ -337,6 +378,11 @@ static void publish(struct dc_timesync_snapshot* s, const struct dc_timesync_sna
   s->skew_ppb = v->skew_ppb;
   s->updated_mono_ns = v->updated_mono_ns;
   s->residual_rms_ns = v->residual_rms_ns;
+  // v2 local clock registry -- must be copied here too; this function is field-by-field, not a
+  // memcpy, so any field added to the struct is silently dropped until it is added below.
+  s->n_clocks = v->n_clocks;
+  s->synced_phc_index = v->synced_phc_index;
+  for (uint32_t i = 0; i < v->n_clocks && i < DC_TIMESYNC_MAX_CLOCKS; i++) s->clocks[i] = v->clocks[i];
   __atomic_thread_fence(__ATOMIC_RELEASE);
   __atomic_store_n(&s->seq, next, __ATOMIC_RELAXED);  // even: consistent
 }
@@ -370,6 +416,13 @@ int main(int argc, char** argv) {
     printf("  offset=%lld ns  skew=%lld ppb  residual_rms=%.0f ns  age=%lldms\n",
            (long long)shm->offset_ns, (long long)shm->skew_ppb, shm->residual_rms_ns,
            (long long)((mono_ns() - shm->updated_mono_ns) / 1000000));
+    if (shm->version >= 2) {  // v2 local clock registry: how to remap a hw ts from ANY local PHC
+      printf("  clocks: n=%u synced_phc=/dev/ptp%d\n", shm->n_clocks, shm->synced_phc_index);
+      for (uint32_t i = 0; i < shm->n_clocks && i < DC_TIMESYNC_MAX_CLOCKS; i++)
+        printf("    /dev/ptp%-2d valid=%u delta_to_synced=%lld ns%s\n", shm->clocks[i].phc_index,
+               shm->clocks[i].valid, (long long)shm->clocks[i].delta_to_synced_ns,
+               shm->clocks[i].phc_index == shm->synced_phc_index ? "  (synced)" : "");
+    }
     return 0;
   }
 
@@ -419,6 +472,7 @@ int main(int argc, char** argv) {
         v.bridge_mono_to_phc_ns = br;
         v.anchor_phc_ns = (int64_t)phc_ref;
         v.updated_mono_ns = now;
+        fill_clock_registry(&v, phc);
         publish(shm, &v);
         last_pub = now;
       }
@@ -486,6 +540,7 @@ int main(int argc, char** argv) {
           v.skew_ppb = (int64_t)b;   // ns per second
           v.updated_mono_ns = mono_ns();
           v.residual_rms_ns = __builtin_sqrt(var / wn);
+          fill_clock_registry(&v, phc);
           publish(shm, &v);
         }
       }

@@ -15,10 +15,16 @@
  * Standard headers
  */
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <dlfcn.h>
 #include <execinfo.h>
 #include <fcntl.h>
 #include <infiniband/verbs.h>
+#include <linux/ethtool.h>
+#include <linux/sockios.h>
+#include <net/if.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -28,6 +34,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <unordered_map>
 #include <unordered_set>
 
 /**
@@ -165,7 +172,8 @@ static inline void dc_sink_flush(dc_sink* s) {
     s->len = 0;
   }
 }
-static void dc_hwts_emit(uint64_t hw, uint64_t wr_id, uint32_t op, uint32_t imm, uint32_t qp) {
+static void dc_hwts_emit(uint64_t hw, uint64_t wr_id, uint32_t op, uint32_t imm, uint32_t qp,
+                         int phc, const char* tier) {
   dc_sink* s = &dc_ts_sink;
   if (s->fd == -2) return;
   if (s->fd < 0) {  // first completion on this thread -> open <dir>/dc_hwts_<pid>_<tid>.csv
@@ -180,16 +188,16 @@ static void dc_hwts_emit(uint64_t hw, uint64_t wr_id, uint32_t op, uint32_t imm,
       s->fd = -2;
       return;
     }
-    const char* hdr = "cpu_ns,hw_ns,wr_id,opcode,imm,qp_num\n";
+    const char* hdr = "cpu_ns,hw_ns,wr_id,opcode,imm,qp_num,phc,tier\n";
     ssize_t w = write(s->fd, hdr, strlen(hdr));
     (void)w;
   }
   struct timespec t;
   clock_gettime(CLOCK_REALTIME, &t);
   uint64_t cpu = (uint64_t)t.tv_sec * 1000000000ull + t.tv_nsec;
-  int k = snprintf(s->buf + s->len, sizeof(s->buf) - s->len, "%llu,%llu,%llu,%u,%u,%u\n",
+  int k = snprintf(s->buf + s->len, sizeof(s->buf) - s->len, "%llu,%llu,%llu,%u,%u,%u,%d,%s\n",
                    (unsigned long long)cpu, (unsigned long long)hw, (unsigned long long)wr_id, op,
-                   imm, qp);
+                   imm, qp, phc, tier);
   if (k > 0) s->len += (size_t)k;
   dc_completions++;
   if (++s->n % DC_SINK_FLUSH_N == 0 || s->len + 128 >= sizeof(s->buf)) dc_sink_flush(s);
@@ -211,12 +219,46 @@ static int dc_hwts_on(void) {
   return v;
 }
 
-// Extended CQs WE created (O(1) membership). Only ours are extended; polling a non-extended CQ as
-// extended derefs a garbage start_poll pointer -> dc_poll_cq bridges ours, delegates the rest.
-static std::unordered_set<struct ibv_cq*> dc_our_cqs;
-static inline int dc_is_ours(struct ibv_cq* cq) {
-  return dc_our_cqs.find(cq) != dc_our_cqs.end();
+// Which PHC hardware-stamps this context's completions. A node has several independent PHCs (4 on
+// BlueField) and a hw timestamp is meaningless until you know which one it came from -- that is the
+// clock_id the dc_timesync registry keys its remap table on. Resolved ONCE per CQ (sysfs + one
+// ethtool ioctl), never on the poll path. An ibv device can expose several netdevs and only one
+// carries a PHC (e.g. mlx5_0 -> p0 has PHC 0 while pf0hpf has none), so take the first with a valid
+// index. Returns -1 if unknown -> the consumer must NOT remap that timestamp.
+static int dc_phc_of_context(struct ibv_context* ctx) {
+  if (!ctx || !ctx->device) return -1;
+  const char* dev = ibv_get_device_name(ctx->device);
+  if (!dev) return -1;
+  char dir[256];
+  snprintf(dir, sizeof(dir), "/sys/class/infiniband/%s/device/net", dev);
+  DIR* d = opendir(dir);
+  if (!d) return -1;
+  int phc = -1;
+  for (struct dirent* e; (e = readdir(d)) != nullptr;) {
+    if (e->d_name[0] == '.') continue;
+    struct ethtool_ts_info info = {};
+    info.cmd = ETHTOOL_GET_TS_INFO;
+    struct ifreq ifr = {};
+    strncpy(ifr.ifr_name, e->d_name, IFNAMSIZ - 1);
+    ifr.ifr_data = (char*)&info;
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) continue;
+    int rc = ioctl(s, SIOCETHTOOL, &ifr);
+    close(s);
+    if (rc == 0 && info.phc_index >= 0) {
+      phc = info.phc_index;
+      break;
+    }
+  }
+  closedir(d);
+  return phc;
 }
+
+// Extended CQs WE created -> the PHC their timestamps are on. Only ours are extended; polling a
+// non-extended CQ as extended derefs a garbage start_poll pointer -> dc_poll_cq bridges ours,
+// delegates the rest. Using a map means the poll path gets the clock_id from the SAME lookup it
+// already does for membership -- no extra hot-path cost.
+static std::unordered_map<struct ibv_cq*, int> dc_our_cqs;
 
 // ---- WITH_IMM post marker (reorder-robust wire key on the SENDER) ----
 // A send completion carries no immediate, and for DDS the response-meta write (RDMA_WRITE_WITH_IMM,
@@ -230,7 +272,7 @@ static int dc_post_send(struct ibv_qp* qp, struct ibv_send_wr* wr, struct ibv_se
   for (struct ibv_send_wr* w = wr; w; w = w->next) {
     if (w->opcode == IBV_WR_RDMA_WRITE_WITH_IMM || w->opcode == IBV_WR_SEND_WITH_IMM) {
       dc_post_imm++;  // DC_DEBUG only
-      dc_hwts_emit(0, w->wr_id, 250, ntohl(w->imm_data), qp->qp_num);
+      dc_hwts_emit(0, w->wr_id, 250, ntohl(w->imm_data), qp->qp_num, -1, "cpu");
     }
   }
   return dc_orig_post_send ? dc_orig_post_send(qp, wr, bad) : -1;
@@ -239,8 +281,10 @@ static int dc_post_send(struct ibv_qp* qp, struct ibv_send_wr* wr, struct ibv_se
 // bridge invoked in place of the provider poll_cq (via the hijacked context->ops.poll_cq): runs the
 // extended poll, reads the hardware completion timestamp, and fills the app's legacy ibv_wc.
 static int dc_poll_cq(struct ibv_cq* cq, int ne, struct ibv_wc* wc) {
-  if (!dc_is_ours(cq))  // not an extended CQ we made -> use the real provider poll
+  auto it = dc_our_cqs.find(cq);
+  if (it == dc_our_cqs.end())  // not an extended CQ we made -> use the real provider poll
     return dc_orig_poll_cq ? dc_orig_poll_cq(cq, ne, wc) : 0;
+  const int cq_phc = it->second;  // clock_id these hw timestamps are on
   struct ibv_cq_ex* cqx = (struct ibv_cq_ex*)cq;  // layout-compatible (ibv_cq_ex_to_cq is a cast)
   struct ibv_poll_cq_attr attr = {0};
   if (ibv_start_poll(cqx, &attr)) return 0;  // ENOENT/empty or error
@@ -257,7 +301,7 @@ static int dc_poll_cq(struct ibv_cq* cq, int ne, struct ibv_wc* wc) {
         dc_wallclock ? ibv_wc_read_completion_wallclock_ns(cqx) : ibv_wc_read_completion_ts(cqx);
     // recv-with-imm carries the wire key directly; senders emit theirs at post (opcode=250 marker).
     uint32_t imm = (wc[i].wc_flags & IBV_WC_WITH_IMM) ? wc[i].imm_data : 0;
-    dc_hwts_emit(hw, cqx->wr_id, (uint32_t)wc[i].opcode, imm, wc[i].qp_num);  // client self-emit
+    dc_hwts_emit(hw, cqx->wr_id, (uint32_t)wc[i].opcode, imm, wc[i].qp_num, cq_phc, "hw");
     if (dc_uprobe_on())  // opt-in hot path: per-completion kernel trap, unsafe on bulk data planes
       datacrumbs_rdma_completion(hw, cqx->wr_id, (uint32_t)wc[i].opcode, imm, wc[i].qp_num);
     i++;
@@ -313,7 +357,7 @@ __attribute__((visibility("default"))) struct ibv_cq* ibv_create_cq(
   if (!dc_orig_post_send) dc_orig_post_send = context->ops.post_send;  // for posted-imm correlation
   context->ops.post_send = dc_post_send;
   struct ibv_cq* ret = ibv_cq_ex_to_cq(cqx);
-  dc_our_cqs.insert(ret);
+  dc_our_cqs.emplace(ret, dc_phc_of_context(context));
   dc_cq_captured++;
   return ret;
 }

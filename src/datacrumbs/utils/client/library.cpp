@@ -256,10 +256,27 @@ static int dc_fmt_pfw() {
 // timesync (cpu_ns is CLOCK_REALTIME = same epoch as the .pfw us clock; hw_ns is the NIC wallclock).
 // Flushed every DC_SINK_FLUSH_N records (not just at destructor): the SPDK backend traps SIGTERM, so
 // a destructor-only flush would lose everything. The old hot path stays available via DC_HWTS_UPROBE.
-#define DC_SINK_BUF 65536
-#define DC_SINK_FLUSH_N 32  // flush cadence: low enough that a proxy killed/aborted mid-run still
-                            // leaves most completions on disk (destructor flush is skipped on SIGKILL/
-                            // abort); still ~1 write per 32 completions, negligible on the DDS firehose.
+// gettid() is a SYSCALL and the .pfw line used to call it per event, on the same busy-poll thread that
+// is draining the data plane. It is invariant per thread -- cache it. (Measured: the .pfw emit path cost
+// 4.2x the CSV path; this and the oversized line were the difference.)
+static thread_local long dc_tid_cached = 0;
+static inline long dc_tid() {
+  if (!dc_tid_cached) dc_tid_cached = (long)syscall(SYS_gettid);
+  return dc_tid_cached;
+}
+#define DC_SINK_BUF 262144
+#define DC_SINK_FLUSH_N dc_flush_n()
+// Flush cadence trades crash-safety for syscalls. Default 256: on a firehose that is ~1 write per 256
+// completions instead of per 32, and a killed proxy still leaves all but the last 256 on disk.
+static int dc_flush_n() {
+  static int v = -1;
+  if (v < 0) {
+    const char* e = getenv("DC_HWTS_FLUSH_N");
+    v = (e && *e) ? atoi(e) : 256;
+    if (v < 1) v = 1;
+  }
+  return v;
+}
 struct dc_sink {
   int fd = -1;  // -2 = open failed once, stop trying
   size_t len = 0;
@@ -288,6 +305,26 @@ static inline void dc_sink_flush(dc_sink* s) {
     s->len = 0;
   }
 }
+// The clock registry, emitted identically into both formats (a ph:"M" metadata event for .pfw, the
+// same object behind a "# " comment for CSV). Keeping ONE writer is the point: a capture that cannot
+// describe its own clocks cannot be placed on the cross-node timeline, and that must not depend on
+// which output format someone picked for performance reasons.
+static int dc_registry_json(char* out, size_t cap, const char* prefix, long tid) {
+  int o = snprintf(out, cap,
+                   "%s{\"ph\":\"M\",\"name\":\"datacrumbs.clock_registry\",\"pid\":%d,"
+                   "\"tid\":%ld,\"args\":{\"valid\":%d,\"ref_id\":%u,\"self_id\":%u,"
+                   "\"synced_phc\":%d,\"anchor_phc_ns\":%lld,\"offset_ns\":%lld,"
+                   "\"skew_ppb\":%lld,\"residual_ns\":%.0f,\"clocks\":[",
+                   prefix, getpid(), tid, dc_cm.valid, dc_cm.ref_id, dc_cm.self_id, dc_cm.synced_phc,
+                   (long long)dc_cm.anchor_phc_ns, (long long)dc_cm.offset_ns,
+                   (long long)dc_cm.skew_ppb, dc_cm.residual_rms_ns);
+  for (int i = 0; i < dc_cm.n_clocks && o < (int)cap - 128; i++)
+    o += snprintf(out + o, cap - o, "%s{\"phc\":%d,\"delta_to_synced_ns\":%lld}",
+                  i ? "," : "", dc_cm.phc_id[i], (long long)dc_cm.phc_delta[i]);
+  o += snprintf(out + o, cap - o, "]}}\n");
+  return o;
+}
+
 static void dc_hwts_emit(uint64_t hw, uint64_t wr_id, uint32_t op, uint32_t imm, uint32_t qp,
                          int phc, const char* tier) {
   dc_sink* s = &dc_ts_sink;
@@ -297,7 +334,7 @@ static void dc_hwts_emit(uint64_t hw, uint64_t wr_id, uint32_t op, uint32_t imm,
     if (!dir || !*dir) dir = getenv("DATACRUMBS_TRACE_DIR");
     if (!dir || !*dir) dir = "/tmp";
     char path[512];
-    long tid = (long)syscall(SYS_gettid);
+    long tid = dc_tid();
     if (!dc_cm_loaded) { dc_cm_loaded = 1; dc_load_clockmap(); }
     snprintf(path, sizeof(path), "%s/dc_hwts_%d_%ld.%s", dir, getpid(), tid,
              dc_fmt_pfw() ? "pfw" : "csv");
@@ -312,26 +349,22 @@ static void dc_hwts_emit(uint64_t hw, uint64_t wr_id, uint32_t op, uint32_t imm,
       return;
     }
     if (!dc_fmt_pfw()) {
-      const char* hdr = "cpu_ns,hw_ns,wr_id,opcode,imm,qp_num,phc,tier\n";
-      ssize_t w = write(s->fd, hdr, strlen(hdr));
+      // CSV carries the SAME clock registry as .pfw, as a leading # comment. Without it CSV was a
+      // second-class format that could not be aligned cross-node, which is why .pfw was made the
+      // default -- at 4.2x the emit cost. With the registry here, the compact format stays fully
+      // self-describing and dc_trace.py/csv2pfw.py can reconstruct the trace losslessly.
+      char hdr[2048];
+      int o = dc_registry_json(hdr, sizeof(hdr), "# ", tid);
+      o += snprintf(hdr + o, sizeof(hdr) - o, "cpu_ns,hw_ns,wr_id,opcode,imm,qp_num,phc,tier\n");
+      ssize_t w = write(s->fd, hdr, o);
       (void)w;
     } else {
       // Chrome-trace stream + a ph:"M" metadata event carrying the whole clock registry, so the
       // trace is SELF-DESCRIBING: any consumer can (re)align it with no external state, no snapshot
       // file, and no per-run offset pasted into a script.
       char hdr[2048];
-      int o = snprintf(hdr, sizeof(hdr),
-                       "[\n{\"ph\":\"M\",\"name\":\"datacrumbs.clock_registry\",\"pid\":%d,"
-                       "\"tid\":%ld,\"args\":{\"valid\":%d,\"ref_id\":%u,\"self_id\":%u,"
-                       "\"synced_phc\":%d,\"anchor_phc_ns\":%lld,\"offset_ns\":%lld,"
-                       "\"skew_ppb\":%lld,\"residual_ns\":%.0f,\"clocks\":[",
-                       getpid(), tid, dc_cm.valid, dc_cm.ref_id, dc_cm.self_id, dc_cm.synced_phc,
-                       (long long)dc_cm.anchor_phc_ns, (long long)dc_cm.offset_ns,
-                       (long long)dc_cm.skew_ppb, dc_cm.residual_rms_ns);
-      for (int i = 0; i < dc_cm.n_clocks && o < (int)sizeof(hdr) - 128; i++)
-        o += snprintf(hdr + o, sizeof(hdr) - o, "%s{\"phc\":%d,\"delta_to_synced_ns\":%lld}",
-                      i ? "," : "", dc_cm.phc_id[i], (long long)dc_cm.phc_delta[i]);
-      o += snprintf(hdr + o, sizeof(hdr) - o, "]}}\n");
+      int o = snprintf(hdr, sizeof(hdr), "[\n");
+      o += dc_registry_json(hdr + o, sizeof(hdr) - o, "", tid);
       ssize_t w = write(s->fd, hdr, o);
       (void)w;
     }
@@ -355,7 +388,7 @@ static void dc_hwts_emit(uint64_t hw, uint64_t wr_id, uint32_t op, uint32_t imm,
                  "\"cpu_ns\":%llu,\"phc\":%d,\"tier\":\"%s\",\"wr_id\":%llu,\"opcode\":%u,"
                  "\"imm\":%u,\"qp\":%u}}\n",
                  (op == 250) ? "post" : "completion", (unsigned long long)(ref / 1000), getpid(),
-                 (long)syscall(SYS_gettid), ref ? 1 : 0, (unsigned long long)(hw ? hw : cpu),
+                 dc_tid(), ref ? 1 : 0, (unsigned long long)(hw ? hw : cpu),
                  (unsigned long long)cpu, phc, tier, (unsigned long long)wr_id, op, imm, qp);
   }
   if (k > 0) s->len += (size_t)k;

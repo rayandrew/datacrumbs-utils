@@ -233,9 +233,12 @@ static uint64_t dc_to_ref_ns(uint64_t t, int phc) {
   return (uint64_t)(synced + dc_cm.offset_ns + (int64_t)drift);
 }
 
-// pfw (in-trace) by default; DC_HWTS_FORMAT=csv keeps the compact sink for firehose-rate paths
-// (the DDS data plane emits ~3.9M completions -- as JSON that is ~4x the bytes and would bury the
-// few thousand uprobe events you actually want to look at).
+// pfw (in-trace, self-describing: carries the clock registry) by default. DC_HWTS_FORMAT=csv keeps the
+// compact sink, and it is not legacy baggage -- MEASURED 249 bytes/event as .pfw vs 52 as CSV (4.8x).
+// The DDS data plane emits ~3.9M completions per run: 199MB as CSV, ~950MB as .pfw, written by the SPDK
+// busy-poll reactor that a per-completion kernel trap already deadlocked once. So: .pfw for anything you
+// want on the unified timeline, CSV for firehose data planes. Archived captures are CSV too, and
+// experiments/lib/dc_trace.py reads both.
 static int dc_fmt_pfw() {
   static int v = -1;
   if (v < 0) {

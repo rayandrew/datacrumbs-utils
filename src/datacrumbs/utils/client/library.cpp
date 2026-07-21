@@ -17,6 +17,8 @@
 #include <arpa/inet.h>
 #include <dirent.h>
 #include <dlfcn.h>
+#include <errno.h>
+#include <sys/stat.h>
 #include <execinfo.h>
 #include <fcntl.h>
 #include <infiniband/verbs.h>
@@ -95,6 +97,8 @@ static unsigned long long dc_cq_total = 0;      // ibv_create_cq calls seen
 static unsigned long long dc_cq_captured = 0;   // upgraded to a timestamped extended CQ + poll hijacked
 static unsigned long long dc_cq_fallback = 0;   // upgrade failed -> plain CQ, NOT captured
 static unsigned long long dc_completions = 0;   // completions actually self-emitted
+// hook ENTRY counts (not emits): distinguishes "our hook never ran" from "it ran but did not emit".
+static unsigned long long dc_n_pollcq = 0, dc_n_startpoll = 0, dc_n_nextpoll = 0, dc_n_postsend = 0;
 static int dc_hwts_on(void);  // fwd decl (defined with the CQ interposition below)
 // imm/qp_num: wire-observable join keys read from the completion (no app change). imm is valid on
 // recv-with-immediate only (tag=imm&0xFF, slot=imm>>8); qp_num separates QPs/legs.
@@ -119,6 +123,9 @@ __attribute__((destructor)) static void dc_emit_report(void) {
             "cq total=%llu captured=%llu fallback=%llu (pid %d)\n",
             dc_emit_count, dc_post_imm, dc_completions, dc_cq_total, dc_cq_captured, dc_cq_fallback,
             getpid());
+  if (getenv("DC_DEBUG"))
+    fprintf(stderr, "[dc-client] hook entries: poll_cq=%llu start_poll=%llu next_poll=%llu post_send=%llu\n",
+            dc_n_pollcq, dc_n_startpoll, dc_n_nextpoll, dc_n_postsend);
   // ALWAYS warn (not DC_DEBUG-gated): zero capture must never look like "no traffic".
   // The worst case is dc_cq_total == 0: we were asked to capture RDMA and never even saw a CQ created,
   // i.e. the app builds its CQ through an API we do not hook. NB ibv_create_cq_ex is a static inline
@@ -291,8 +298,13 @@ static void dc_hwts_emit(uint64_t hw, uint64_t wr_id, uint32_t op, uint32_t imm,
     if (!dc_cm_loaded) { dc_cm_loaded = 1; dc_load_clockmap(); }
     snprintf(path, sizeof(path), "%s/dc_hwts_%d_%ld.%s", dir, getpid(), tid,
              dc_fmt_pfw() ? "pfw" : "csv");
+    mkdir(dir, 0755);  // DC_HWTS_OUT pointing at a non-existent dir silently disabled capture for a
+                       // whole debugging session (fd=-2 below is permanent) -- create it, and if it
+                       // still fails SAY SO. A capture path must never fail quietly.
     s->fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (s->fd < 0) {
+      fprintf(stderr, "[dc-client] ERROR: cannot open %s (%s) -- hw-timestamp capture DISABLED\n",
+              path, strerror(errno));
       s->fd = -2;
       return;
     }
@@ -417,7 +429,15 @@ static int dc_phc_of_context(struct ibv_context* ctx) {
 // non-extended CQ as extended derefs a garbage start_poll pointer -> dc_poll_cq bridges ours,
 // delegates the rest. Using a map means the poll path gets the clock_id from the SAME lookup it
 // already does for membership -- no extra hot-path cost.
-static std::unordered_map<struct ibv_cq*, int> dc_our_cqs;
+struct dc_cqinfo {
+  int phc = -1;              // clock_id these hw timestamps are on
+  uint64_t wc_flags = 0;     // flags the CQ was ACTUALLY created with -> which read_*() are legal
+  int (*start_poll)(struct ibv_cq_ex*, struct ibv_poll_cq_attr*) = nullptr;  // originals, when we
+  int (*next_poll)(struct ibv_cq_ex*) = nullptr;                             // hook the ex poll path
+  struct ibv_cq_ex* cqx = nullptr;  // kept so the exit summary can re-check our pfns are still installed
+};
+static std::unordered_map<struct ibv_cq*, dc_cqinfo> dc_our_cqs;
+static thread_local int dc_in_poll_bridge = 0;  // set by dc_poll_cq so we do not emit twice
 
 // ---- WITH_IMM post marker (reorder-robust wire key on the SENDER) ----
 // A send completion carries no immediate, and for DDS the response-meta write (RDMA_WRITE_WITH_IMM,
@@ -428,6 +448,7 @@ static std::unordered_map<struct ibv_cq*, int> dc_our_cqs;
 // (and the sync CSV write) fire only on the rare WITH_IMM posts -- no per-completion map/lock/ring.
 static int (*dc_orig_post_send)(struct ibv_qp*, struct ibv_send_wr*, struct ibv_send_wr**) = nullptr;
 static int dc_post_send(struct ibv_qp* qp, struct ibv_send_wr* wr, struct ibv_send_wr** bad) {
+  dc_n_postsend++;
   for (struct ibv_send_wr* w = wr; w; w = w->next) {
     if (w->opcode == IBV_WR_RDMA_WRITE_WITH_IMM || w->opcode == IBV_WR_SEND_WITH_IMM) {
       dc_post_imm++;  // DC_DEBUG only
@@ -440,13 +461,21 @@ static int dc_post_send(struct ibv_qp* qp, struct ibv_send_wr* wr, struct ibv_se
 // bridge invoked in place of the provider poll_cq (via the hijacked context->ops.poll_cq): runs the
 // extended poll, reads the hardware completion timestamp, and fills the app's legacy ibv_wc.
 static int dc_poll_cq(struct ibv_cq* cq, int ne, struct ibv_wc* wc) {
+  dc_n_pollcq++;
   auto it = dc_our_cqs.find(cq);
   if (it == dc_our_cqs.end())  // not an extended CQ we made -> use the real provider poll
     return dc_orig_poll_cq ? dc_orig_poll_cq(cq, ne, wc) : 0;
-  const int cq_phc = it->second;  // clock_id these hw timestamps are on
+  const int cq_phc = it->second.phc;  // clock_id these hw timestamps are on
   struct ibv_cq_ex* cqx = (struct ibv_cq_ex*)cq;  // layout-compatible (ibv_cq_ex_to_cq is a cast)
   struct ibv_poll_cq_attr attr = {0};
-  if (ibv_start_poll(cqx, &attr)) return 0;  // ENOENT/empty or error
+  // This bridge emits for every completion itself, and the CQ's start_poll/next_poll may ALSO be
+  // hooked (an app can create via _ex yet poll with legacy ibv_poll_cq). Suppress the CQ-level emit
+  // for the duration so each completion is recorded exactly once.
+  dc_in_poll_bridge = 1;
+  if (ibv_start_poll(cqx, &attr)) {
+    dc_in_poll_bridge = 0;
+    return 0;  // ENOENT/empty or error
+  }
   int i = 0;
   do {
     wc[i].wr_id = cqx->wr_id;
@@ -470,7 +499,87 @@ static int dc_poll_cq(struct ibv_cq* cq, int ne, struct ibv_wc* wc) {
     if (i >= ne) break;
   } while (ibv_next_poll(cqx) == 0);
   ibv_end_poll(cqx);
+  dc_in_poll_bridge = 0;
   return i;
+}
+
+// ---- extended-CQ poll hook ----
+// An app using ibv_cq_ex polls with ibv_start_poll/ibv_next_poll, which are inlines calling function
+// pointers ON THE CQ (cq->start_poll), NOT context->ops.poll_cq. So upgrading such a CQ is not enough:
+// without hooking these we register the CQ and still capture nothing (measured on ib_send_lat:
+// cq total=2 captured=2, self_emit=0). Hook them per-CQ and emit on each successful poll.
+//
+// Field safety: read_*() is only legal for fields whose flag was requested at creation, so every read
+// is gated on the CQ's actual wc_flags. (Reading an unrequested field is exactly what segfaulted the
+// app earlier.) wr_id/status are plain struct members and always valid.
+
+static void dc_emit_from_cqex(struct ibv_cq_ex* cqx, const dc_cqinfo& ci) {
+  if (dc_in_poll_bridge) return;  // the legacy bridge already emits for this completion
+  uint32_t opcode = ibv_wc_read_opcode(cqx);  // core field, always valid
+  uint32_t imm = 0;
+  if (ci.wc_flags & IBV_WC_EX_WITH_IMM) {
+    uint32_t f = ibv_wc_read_wc_flags(cqx);
+    if (f & IBV_WC_WITH_IMM) imm = ibv_wc_read_imm_data(cqx);
+  }
+  uint32_t qp = (ci.wc_flags & IBV_WC_EX_WITH_QP_NUM) ? ibv_wc_read_qp_num(cqx) : 0;
+  uint64_t hw = 0;
+  if (ci.wc_flags & IBV_WC_EX_WITH_COMPLETION_TIMESTAMP_WALLCLOCK)
+    hw = ibv_wc_read_completion_wallclock_ns(cqx);
+  else if (ci.wc_flags & IBV_WC_EX_WITH_COMPLETION_TIMESTAMP)
+    hw = ibv_wc_read_completion_ts(cqx);
+  dc_hwts_emit(hw, cqx->wr_id, opcode, imm, qp, ci.phc, "hw");
+}
+
+// The ORIGINALS are global, not per-CQ: one provider per process here, and more importantly the
+// application's correctness must never depend on our bookkeeping. If our lookup misses we still call
+// through and simply do not record -- an earlier version returned ENOENT on a miss, which told the app
+// "no completions" forever and hung ib_send_lat. Losing capture is acceptable; breaking the app is not.
+static int (*dc_orig_start_poll)(struct ibv_cq_ex*, struct ibv_poll_cq_attr*) = nullptr;
+static int (*dc_orig_next_poll)(struct ibv_cq_ex*) = nullptr;
+
+static int dc_start_poll(struct ibv_cq_ex* cqx, struct ibv_poll_cq_attr* attr) {
+  dc_n_startpoll++;
+  if (!dc_orig_start_poll) return ENOENT;
+  int rc = dc_orig_start_poll(cqx, attr);
+  if (rc == 0) {
+    auto it = dc_our_cqs.find(ibv_cq_ex_to_cq(cqx));
+    if (it != dc_our_cqs.end()) dc_emit_from_cqex(cqx, it->second);
+  }
+  return rc;
+}
+static int dc_next_poll(struct ibv_cq_ex* cqx) {
+  dc_n_nextpoll++;
+  if (!dc_orig_next_poll) return ENOENT;
+  int rc = dc_orig_next_poll(cqx);
+  if (rc == 0) {
+    auto it = dc_our_cqs.find(ibv_cq_ex_to_cq(cqx));
+    if (it != dc_our_cqs.end()) dc_emit_from_cqex(cqx, it->second);
+  }
+  return rc;
+}
+
+// The check must run while the app is still alive: dc_our_cqs is a static C++ object and is destroyed
+// BEFORE our ((destructor)), so inspecting it there sees an empty map (measured: no output at all).
+// ibv_destroy_cq is a real exported symbol, so we can interpose it and check at teardown instead.
+extern "C" __attribute__((visibility("default"))) int ibv_destroy_cq(struct ibv_cq* cq) {
+  static int (*real_destroy)(struct ibv_cq*) = nullptr;
+  if (!real_destroy) {
+    real_destroy = (int (*)(struct ibv_cq*))dlvsym(RTLD_NEXT, "ibv_destroy_cq", "IBVERBS_1.1");
+    if (!real_destroy) real_destroy = (int (*)(struct ibv_cq*))dlsym(RTLD_NEXT, "ibv_destroy_cq");
+  }
+  if (getenv("DC_DEBUG")) {
+    auto it = dc_our_cqs.find(cq);
+    if (it != dc_our_cqs.end() && it->second.cqx)
+      fprintf(stderr, "[dc-client] cq %p pfns at destroy: start_poll=%s next_poll=%s ops.poll_cq=%s\n",
+              (void*)it->second.cqx,
+              it->second.cqx->start_poll == dc_start_poll ? "OURS" : "OVERWRITTEN",
+              it->second.cqx->next_poll == dc_next_poll ? "OURS" : "OVERWRITTEN",
+              cq->context->ops.poll_cq == dc_poll_cq ? "OURS" : "OVERWRITTEN");
+    else
+      fprintf(stderr, "[dc-client] destroy of UNREGISTERED cq %p\n", (void*)cq);
+  }
+  dc_our_cqs.erase(cq);
+  return real_destroy ? real_destroy(cq) : -1;
 }
 
 // ---- ops-table hook: catch the INLINE ibv_create_cq_ex ----
@@ -482,7 +591,7 @@ int dc_opshook_level(void) {
   static int v = -1;
   if (v < 0) {
     const char* e = getenv("DC_HWTS_OPSHOOK");
-    v = (e && *e) ? atoi(e) : 1;  // ON by default; DC_HWTS_OPSHOOK=0 disables (escape hatch)
+    v = (e && *e) ? atoi(e) : 0;  // OFF by default -- see the boundary note above
   }
   return v;
 }
@@ -522,6 +631,7 @@ static struct ibv_cq_ex* dc_create_cq_ex(struct ibv_context* context,
     dc_cq_fallback++;
     return dc_orig_create_cq_ex(context, attr);
   }
+  const uint64_t made_flags = attr->wc_flags;  // what the CQ was ACTUALLY created with
   attr->wc_flags = caller_flags;  // never leave the caller's struct mutated
   if (lvl == 3) return cqx;        // bisect: flags applied, but do not touch ops or register
   if (lvl != 5) {                  // 5 = register only, no ops hijack
@@ -530,8 +640,17 @@ static struct ibv_cq_ex* dc_create_cq_ex(struct ibv_context* context,
     if (!dc_orig_post_send) dc_orig_post_send = context->ops.post_send;
     context->ops.post_send = dc_post_send;
   }
-  if (lvl != 4)                    // 4 = ops hijack only, no registration
-    dc_our_cqs.emplace(ibv_cq_ex_to_cq(cqx), dc_phc_of_context(context));
+  if (lvl != 4) {                  // 4 = ops hijack only, no registration
+    dc_cqinfo ci;
+    ci.phc = dc_phc_of_context(context);
+    ci.wc_flags = made_flags;       // augmented set -> which read_*() are legal
+    ci.cqx = cqx;
+    dc_our_cqs.emplace(ibv_cq_ex_to_cq(cqx), ci);
+    if (!dc_orig_start_poll) dc_orig_start_poll = cqx->start_poll;
+    if (!dc_orig_next_poll) dc_orig_next_poll = cqx->next_poll;
+    if (cqx->start_poll == dc_orig_start_poll) cqx->start_poll = dc_start_poll;
+    if (cqx->next_poll == dc_orig_next_poll) cqx->next_poll = dc_next_poll;
+  }
   dc_cq_captured++;
   return cqx;
 }
@@ -634,7 +753,8 @@ __attribute__((visibility("default"))) struct ibv_cq* ibv_create_cq(
   if (!dc_orig_post_send) dc_orig_post_send = context->ops.post_send;  // for posted-imm correlation
   context->ops.post_send = dc_post_send;
   struct ibv_cq* ret = ibv_cq_ex_to_cq(cqx);
-  dc_our_cqs.emplace(ret, dc_phc_of_context(context));
+  { dc_cqinfo ci; ci.phc = dc_phc_of_context(context); ci.wc_flags = attr.wc_flags;
+    dc_our_cqs.emplace(ret, ci); }
   dc_cq_captured++;
   dc_in_legacy_create = 0;
   return ret;

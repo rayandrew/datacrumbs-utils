@@ -100,6 +100,7 @@ static unsigned long long dc_completions = 0;   // completions actually self-emi
 // hook ENTRY counts (not emits): distinguishes "our hook never ran" from "it ran but did not emit".
 static unsigned long long dc_n_pollcq = 0, dc_n_startpoll = 0, dc_n_nextpoll = 0, dc_n_postsend = 0;
 static unsigned long long dc_n_wrsend = 0;  // ibv_wr_* send posts (see the send-post hook)
+static unsigned long long dc_n_wrcomplete = 0;  // ibv_wr_complete doorbell rings (opt-in)
 static int dc_hwts_on(void);  // fwd decl (defined with the CQ interposition below)
 // imm/qp_num: wire-observable join keys read from the completion (no app change). imm is valid on
 // recv-with-immediate only (tag=imm&0xFF, slot=imm>>8); qp_num separates QPs/legs.
@@ -126,8 +127,8 @@ __attribute__((destructor)) static void dc_emit_report(void) {
             getpid());
   if (getenv("DC_DEBUG"))
     fprintf(stderr, "[dc-client] hook entries: poll_cq=%llu start_poll=%llu next_poll=%llu "
-            "post_send=%llu wr_send=%llu\n",
-            dc_n_pollcq, dc_n_startpoll, dc_n_nextpoll, dc_n_postsend, dc_n_wrsend);
+            "post_send=%llu wr_send=%llu wr_complete=%llu\n",
+            dc_n_pollcq, dc_n_startpoll, dc_n_nextpoll, dc_n_postsend, dc_n_wrsend, dc_n_wrcomplete);
   // ALWAYS warn (not DC_DEBUG-gated): zero capture must never look like "no traffic".
   // The worst case is dc_cq_total == 0: we were asked to capture RDMA and never even saw a CQ created,
   // i.e. the app builds its CQ through an API we do not hook. NB ibv_create_cq_ex is a static inline
@@ -808,6 +809,21 @@ static void dc_wr_send_imm(struct ibv_qp_ex* qpx, __be32 imm) {
   dc_hwts_emit(0, qpx->wr_id, 250, ntohl(imm), qpx->qp_base.qp_num, -1, "cpu");
 }
 
+// ---- doorbell marker (opcode 251), opt-in DC_HWTS_DOORBELL=1 ----
+// wr_send (opcode 250) marks WQE build; the doorbell rings at wr_complete. Hooking wr_complete would
+// split "post -> arrival" into build->doorbell + doorbell->arrival. FINDING (mlx5 + perftest): the
+// hook installs but wr_complete NEVER fires (measured: wr_send=5000, wr_complete=0) -- perftest does
+// not use the batched transaction API, so ibv_wr_send posts AND rings the doorbell itself. Hence the
+// opcode-250 marker already IS the doorbell instant on this path, and post->arrival has no separable
+// software sub-step; isolating wire from handoff would need a hardware DEPARTURE stamp, which RC does
+// not provide (the CQE ts is ACK-timed). The hook stays for apps that DO batch via wr_complete.
+static int (*dc_orig_wr_complete)(struct ibv_qp_ex*) = nullptr;
+static int dc_wr_complete(struct ibv_qp_ex* qpx) {
+  dc_hwts_emit(0, qpx->wr_id, 251, 0, qpx->qp_base.qp_num, -1, "cpu");  // BEFORE: this rings the bell
+  dc_n_wrcomplete++;
+  return dc_orig_wr_complete(qpx);
+}
+
 static struct ibv_qp* (*dc_orig_create_qp_ex)(struct ibv_context*,
                                               struct ibv_qp_init_attr_ex*) = nullptr;
 static struct ibv_qp* dc_create_qp_ex(struct ibv_context* context,
@@ -826,6 +842,17 @@ static struct ibv_qp* dc_create_qp_ex(struct ibv_context* context,
   if (qpx->wr_send_imm) {
     if (!dc_orig_wr_send_imm) dc_orig_wr_send_imm = qpx->wr_send_imm;
     if (qpx->wr_send_imm == dc_orig_wr_send_imm) qpx->wr_send_imm = dc_wr_send_imm;
+  }
+  if (qpx->wr_complete) {  // opt-in doorbell split: DC_HWTS_DOORBELL=1
+    const char* db = getenv("DC_HWTS_DOORBELL");
+    if (db && *db && db[0] != '0') {
+      if (!dc_orig_wr_complete) dc_orig_wr_complete = qpx->wr_complete;
+      if (qpx->wr_complete == dc_orig_wr_complete) qpx->wr_complete = dc_wr_complete;
+      if (getenv("DC_DEBUG")) fprintf(stderr, "[dc-client] doorbell hook installed on qp %u\n", qp->qp_num);
+    } else if (getenv("DC_DEBUG")) {
+      fprintf(stderr, "[dc-client] doorbell NOT installed: DC_HWTS_DOORBELL=%s wr_complete=%p\n",
+              db ? db : "(unset)", (void*)qpx->wr_complete);
+    }
   }
   if (getenv("DC_DEBUG"))
     fprintf(stderr, "[dc-client] post-hook installed on qp %u\n", qp->qp_num);

@@ -744,6 +744,7 @@ json_object* capture_probe_to_json(const std::shared_ptr<datacrumbs::CaptureProb
       json_object_object_add(config, "file", json_object_new_string(binary_probe->file.c_str()));
       json_object_object_add(config, "include_offsets",
                              json_object_new_boolean(binary_probe->include_offsets));
+      json_object_object_add(config, "hot", json_object_new_boolean(binary_probe->hot));
       break;
     }
     case datacrumbs::CaptureType::USDT: {
@@ -1108,6 +1109,7 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::extractProbes() {
               if (auto uprobe = std::dynamic_pointer_cast<UProbe>(probe)) {
                 uprobe->binary_path = binaryProbe->file;
                 uprobe->include_offsets = binaryProbe->include_offsets;
+                uprobe->hot = binaryProbe->hot;
               }
             } else if (capture_probe->probe_type == ProbeType::KPROBE) {
               result.discovered_function_signatures =
@@ -1259,6 +1261,7 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::extractProbes() {
               if (auto uprobe = std::dynamic_pointer_cast<UProbe>(probe)) {
                 uprobe->binary_path = existingUprobe->binary_path;
                 uprobe->include_offsets = existingUprobe->include_offsets;
+                uprobe->hot = existingUprobe->hot;
               }
             }
             break;
@@ -1745,6 +1748,11 @@ std::unordered_map<std::string, std::shared_ptr<Probe>> ProbeExplorer::loadExist
                                                 &include_offsets_obj) &&
                       json_object_get_type(include_offsets_obj) == json_type_boolean) {
                     uprobe->include_offsets = json_object_get_boolean(include_offsets_obj);
+                  }
+                  json_object* hot_obj = nullptr;
+                  if (json_object_object_get_ex(probe_obj, "hot", &hot_obj) &&
+                      json_object_get_type(hot_obj) == json_type_boolean) {
+                    uprobe->hot = json_object_get_boolean(hot_obj);
                   }
                 }
                 break;

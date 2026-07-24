@@ -327,6 +327,7 @@ ConfigurationManager::ConfigurationManager(int argc, char** argv, bool load_capt
                         ? true
                         : (probe_node["include_offsets"] ? probe_node["include_offsets"].as<bool>()
                                                          : false);
+                binary_probe->hot = probe_node["hot"] ? probe_node["hot"].as<bool>() : false;
                 probe = binary_probe;
                 break;
               }

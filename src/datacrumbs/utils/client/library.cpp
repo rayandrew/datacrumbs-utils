@@ -236,7 +236,11 @@ static uint64_t dc_to_ref_ns(uint64_t t, int phc) {
   return (uint64_t)(synced + dc_cm.offset_ns + (int64_t)drift);
 }
 
-// pfw (in-trace, self-describing: carries the clock registry) by default. DC_HWTS_FORMAT=csv keeps the
+// pfw (in-trace, self-describing: carries the clock registry) by default -- and the ONLY format you
+// should need: DC_HWTS_SAMPLE=N makes .pfw cheap on a firehose (measured: full .pfw 192 MB/s vs
+// 1-in-100 sampled 3080 MB/s, faster than CSV ever was, and directly viewable at 400 events not
+// millions). DC_HWTS_FORMAT=csv (below) is the legacy compact spool, kept for full-fidelity offline
+// delta-analysis only; it is NOT viewable and should not be shipped as an artifact.
 // compact sink, and it is not legacy baggage -- MEASURED 249 bytes/event as .pfw vs 52 as CSV (4.8x).
 // The DDS data plane emits ~3.9M completions per run: 199MB as CSV, ~950MB as .pfw, written by the SPDK
 // busy-poll reactor that a per-completion kernel trap already deadlocked once. So: .pfw for anything you
@@ -363,10 +367,28 @@ static int dc_registry_json(char* out, size_t cap, const char* prefix, long tid)
   return o;
 }
 
+// DC_HWTS_SAMPLE=N emits 1-in-N completions. A viewable .pfw event is inherently ~4x a CSV row
+// (verbose Chrome JSON), so full-rate .pfw on a data-plane firehose (millions/s) is both too slow and
+// unviewable (a viewer cannot render millions of ticks). Sampling makes .pfw cheap AND viewable, which
+// is what lets .pfw be the ONE format -- no CSV spool to convert. Rare markers (post/doorbell) are the
+// join keys and are never sampled out.
+static int dc_sample_n(void) {
+  static int v = -1;
+  if (v < 0) {
+    const char* e = getenv("DC_HWTS_SAMPLE");
+    v = (e && *e) ? atoi(e) : 1;
+    if (v < 1) v = 1;
+  }
+  return v;
+}
+static thread_local unsigned long long dc_sample_ctr = 0;
+
 static void dc_hwts_emit(uint64_t hw, uint64_t wr_id, uint32_t op, uint32_t imm, uint32_t qp,
                          int phc, const char* tier) {
   dc_sink* s = &dc_ts_sink;
   if (s->fd == -2) return;
+  const int nth = dc_sample_n();
+  if (nth > 1 && op != 250 && op != 251 && (dc_sample_ctr++ % (unsigned)nth) != 0) return;
   if (s->fd < 0) {  // first completion on this thread -> open <dir>/dc_hwts_<pid>_<tid>.csv
     const char* dir = getenv("DC_HWTS_OUT");
     if (!dir || !*dir) dir = getenv("DATACRUMBS_TRACE_DIR");

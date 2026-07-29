@@ -39,6 +39,12 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#ifdef DATACRUMBS_DOCA_HWTS
+// DOCA fabric CQE hardware-timestamp capture (see the block at end of file). frida-gum is DOCA-only,
+// so it's compiled in only for the native DPU DOCA build; host/ibverbs builds are untouched.
+#include "frida-gum.h"
+#endif
+
 /**
  * Internal headers
  */
@@ -1021,3 +1027,76 @@ void datacrumbs_init(void) {
 void datacrumbs_fini(void) {
   datacrumbs_stop();
 }
+
+#ifdef DATACRUMBS_DOCA_HWTS
+/**
+ * DOCA fabric CQE hardware-timestamp capture (native datacrumbs, no side-car shim).
+ *
+ * The DPU<->DPU fabric runs on DOCA-RDMA = mlx5 DevX, kernel-bypass. DOCA keeps its own CQ, hidden
+ * from ibv_create_cq, so the DC_HWTS ibverbs interposition above cannot see it, and DOCA exposes no
+ * timestamp API. But priv_doca_cq_poll_one(cq, out_cqe) COPIES the raw 64-byte mlx5 CQE into arg1
+ * (out_cqe) and returns 0 on a hit -- the NIC hardware timestamp sits at out_cqe+48 (__be64), opcode
+ * in op_own>>4 (out_cqe+63), imm at +36. We inline-hook it via frida-gum and feed each completion
+ * into the SAME dc_hwts_emit() path as ibverbs -- so DOCA fabric completions land in the DC_HWTS
+ * .pfw stream. Opt-in: DC_HWTS=1 + DC_HWTS_DOCA=1 (frida hook is extra cost, DOCA data planes only).
+ */
+namespace {
+struct DcDocaCall { gpointer cqe; };
+
+struct _DcDocaListener { GObject parent; };
+G_DECLARE_FINAL_TYPE(DcDocaListener, dc_doca_listener, DC, DOCA_LISTENER, GObject)
+static void dc_doca_listener_iface_init_fwd(gpointer g_iface, gpointer data);  // defined below
+G_DEFINE_TYPE_EXTENDED(  // fwd of the iface init below
+    DcDocaListener, dc_doca_listener, G_TYPE_OBJECT, 0,
+    G_IMPLEMENT_INTERFACE(GUM_TYPE_INVOCATION_LISTENER, dc_doca_listener_iface_init_fwd))
+
+static void dc_doca_on_enter(GumInvocationListener*, GumInvocationContext* ic) {
+  DcDocaCall* d = GUM_IC_GET_INVOCATION_DATA(ic, DcDocaCall);
+  d->cqe = gum_invocation_context_get_nth_argument(ic, 1);  // out_cqe
+}
+static void dc_doca_on_leave(GumInvocationListener*, GumInvocationContext* ic) {
+  if ((int)(intptr_t)gum_invocation_context_get_return_value(ic) != 0) return;  // 5 = CQ empty
+  DcDocaCall* d = GUM_IC_GET_INVOCATION_DATA(ic, DcDocaCall);
+  if (!d->cqe) return;
+  const unsigned char* c = (const unsigned char*)d->cqe;
+  uint64_t hw = __builtin_bswap64(*(volatile const uint64_t*)(c + 48));   // NIC hw timestamp (ns)
+  uint32_t op = c[63] >> 4;                                               // 0=send, 2/3=recv
+  uint32_t imm = __builtin_bswap32(*(volatile const uint32_t*)(c + 36));  // valid on recv-with-imm
+  dc_hwts_emit(hw, 0 /*wr_id*/, op, imm, 0 /*qp*/, -1 /*phc: NIC-PHC, remap in merge*/, "hw");
+}
+static void dc_doca_listener_iface_init_fwd(gpointer g_iface, gpointer) {
+  auto* i = (GumInvocationListenerInterface*)g_iface;
+  i->on_enter = dc_doca_on_enter;
+  i->on_leave = dc_doca_on_leave;
+}
+static void dc_doca_listener_class_init(DcDocaListenerClass*) {}
+static void dc_doca_listener_init(DcDocaListener*) {}
+}  // namespace
+
+// Installed at library load (LD_PRELOAD ctors run after NEEDED libs are mapped, so libdoca_common is
+// present). No-op unless DC_HWTS=1 && DC_HWTS_DOCA=1, so non-DOCA runs pay nothing.
+__attribute__((constructor)) static void dc_doca_hwts_install() {
+  if (!dc_hwts_on()) return;
+  const char* e = getenv("DC_HWTS_DOCA");
+  if (!e || !*e || e[0] == '0') return;
+
+  gum_init_embedded();
+  gpointer target = (gpointer)gum_module_find_export_by_name("libdoca_common.so",
+                                                             "priv_doca_cq_poll_one");
+  if (!target) {  // internal symbol may not export -> fall back to the known offset for this build
+    GumAddress base = gum_module_find_base_address("libdoca_common.so");
+    if (base) target = GSIZE_TO_POINTER(base + 0x57934);
+  }
+  if (!target) {
+    fprintf(stderr, "[dc-client] DC_HWTS_DOCA: priv_doca_cq_poll_one not found (libdoca_common "
+                    "not loaded?)\n");
+    return;
+  }
+  GumInterceptor* it = gum_interceptor_obtain();
+  GObject* lis = (GObject*)g_object_new(dc_doca_listener_get_type(), NULL);
+  gum_interceptor_begin_transaction(it);
+  GumAttachReturn r = gum_interceptor_attach(it, target, GUM_INVOCATION_LISTENER(lis), NULL);
+  gum_interceptor_end_transaction(it);
+  DC_LOG_INFO("DC_HWTS_DOCA: hooked priv_doca_cq_poll_one @%p (attach=%d)", target, (int)r);
+}
+#endif  // DATACRUMBS_DOCA_HWTS

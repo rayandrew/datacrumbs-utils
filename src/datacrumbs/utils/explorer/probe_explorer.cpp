@@ -1383,6 +1383,7 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::extractProbes() {
     }
 
     probe->name = capture_probe->name;
+    probe->system_wide = capture_probe->system_wide;  // propagate the tracepoint pid-gate opt-out
 
     // For syscall probes, normalize to base syscall names expected by attach_ksyscall.
     if (capture_probe->probe_type == ProbeType::SYSCALLS) {

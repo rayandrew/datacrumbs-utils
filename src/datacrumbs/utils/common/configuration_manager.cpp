@@ -390,6 +390,8 @@ ConfigurationManager::ConfigurationManager(int argc, char** argv, bool load_capt
 
             probe->enable_explorer =
                 probe_node["enable_explorer"] ? probe_node["enable_explorer"].as<bool>() : true;
+            probe->system_wide =
+                probe_node["system_wide"] ? probe_node["system_wide"].as<bool>() : false;
             if (!probe_node["probe"] || !probe_node["name"]) {
               throw std::invalid_argument("Probe type and name are required for capture probes.");
             }

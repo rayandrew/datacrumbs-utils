@@ -81,6 +81,8 @@ std::shared_ptr<Probe> probe_from_json(json_object* probe_obj) {
       return std::make_shared<SysCallProbe>(SysCallProbe::fromJson(probe_obj));
     case ProbeType::KPROBE:
       return std::make_shared<KProbe>(KProbe::fromJson(probe_obj));
+    case ProbeType::TRACEPOINT:
+      return std::make_shared<TracepointProbe>(TracepointProbe::fromJson(probe_obj));
     case ProbeType::UPROBE:
       return std::make_shared<UProbe>(UProbe::fromJson(probe_obj));
     case ProbeType::USDT:
@@ -339,6 +341,16 @@ ConfigurationManager::ConfigurationManager(int argc, char** argv, bool load_capt
                   throw std::invalid_argument("Regex is required for KSYM capture type.");
                 }
                 probe = kernel_probe;
+                break;
+              }
+              case CaptureType::TRACEPOINT: {
+                auto tp_probe = std::make_shared<TracepointCaptureProbe>();
+                if (probe_node["regex"]) {
+                  tp_probe->regex = probe_node["regex"].as<std::string>();
+                } else {
+                  throw std::invalid_argument("Regex is required for TRACEPOINT capture type.");
+                }
+                probe = tp_probe;
                 break;
               }
               case CaptureType::USDT: {

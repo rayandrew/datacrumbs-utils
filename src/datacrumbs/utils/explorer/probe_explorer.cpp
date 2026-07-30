@@ -21,6 +21,15 @@
 #include <thread>
 #include <unordered_map>
 
+// Explicit Singleton static-member definitions for TracepointCapture (mirrors ksym_capture.cpp for
+// KSymCapture) -- without these the linker can't resolve Singleton<TracepointCapture>::{instance,
+// stop_creating_instances} used by the tracepoint discovery path.
+template <>
+std::shared_ptr<datacrumbs::TracepointCapture>
+    datacrumbs::Singleton<datacrumbs::TracepointCapture>::instance = nullptr;
+template <>
+bool datacrumbs::Singleton<datacrumbs::TracepointCapture>::stop_creating_instances = false;
+
 namespace {
 
 std::string probe_signing_payload(json_object* summary, json_object* categories) {
@@ -46,6 +55,8 @@ const char* probe_type_to_string(datacrumbs::ProbeType type) {
       return "usdt";
     case datacrumbs::ProbeType::CUSTOM:
       return "custom";
+    case datacrumbs::ProbeType::TRACEPOINT:
+      return "tracepoint";
   }
   return "unknown";
 }
@@ -62,6 +73,8 @@ const char* capture_type_to_string(datacrumbs::CaptureType type) {
       return "usdt";
     case datacrumbs::CaptureType::CUSTOM:
       return "custom";
+    case datacrumbs::CaptureType::TRACEPOINT:
+      return "tracepoint";
   }
   return "unknown";
 }
@@ -1152,6 +1165,14 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::extractProbes() {
             }
           }
           break;
+        case CaptureType::TRACEPOINT:
+          DC_LOG_INFO("Extracting kernel tracepoint probes...");
+          if (auto tpProbe = std::static_pointer_cast<TracepointCaptureProbe>(capture_probe)) {
+            result.function_names =
+                datacrumbs::Singleton<TracepointCapture>::get_instance()->getFunctionsByRegex(
+                    tpProbe->regex);  // "category:name"; no BTF signatures for tracepoints
+          }
+          break;
         case CaptureType::CUSTOM:
           DC_LOG_INFO("Extracting custom probes...");
           if (auto customProbe = std::static_pointer_cast<CustomCaptureProbe>(capture_probe)) {
@@ -1233,6 +1254,9 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::extractProbes() {
         break;
       case ProbeType::KPROBE:
         probe = std::make_shared<KProbe>();
+        break;
+      case ProbeType::TRACEPOINT:
+        probe = std::make_shared<TracepointProbe>();
         break;
       case ProbeType::CUSTOM:
         probe = std::make_shared<CustomProbe>();
@@ -1338,14 +1362,20 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::extractProbes() {
     auto functionNames = std::move(result.function_names);
     auto discovered_function_signatures = std::move(result.discovered_function_signatures);
 
-    // Filter function names by regex if specified
+    // Filter function names by regex if specified. The ':'-strip below is a uprobe "name:offset"
+    // heuristic -- but for tracepoints ':' is the category:name separator, so match the FULL name
+    // (else "sched:sched_switch" is truncated to "sched" and never matches its own pattern).
     if (!capture_probe->regex.empty()) {
       std::regex re(capture_probe->regex, std::regex_constants::icase);
       std::vector<std::string> filteredNames;
+      const bool is_tracepoint = capture_probe->probe_type == ProbeType::TRACEPOINT;
       for (const auto& name : functionNames) {
-        const auto pos = name.find(':');
-        const std::string base_name = (pos != std::string::npos) ? name.substr(0, pos) : name;
-        if (std::regex_match(base_name, re)) {
+        std::string match_target = name;
+        if (!is_tracepoint) {
+          const auto pos = name.find(':');
+          match_target = (pos != std::string::npos) ? name.substr(0, pos) : name;
+        }
+        if (std::regex_match(match_target, re)) {
           filteredNames.push_back(name);
         }
       }
@@ -1460,6 +1490,7 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::extractProbes() {
         }
         break;
       }
+      case CaptureType::TRACEPOINT:  // same name-dedup as KSYM (body doesn't touch the probe fields)
       case CaptureType::KSYM: {
         DC_LOG_INFO("Deduplicating kernel symbol probes...");
         if (auto ksymProbe = std::static_pointer_cast<KernelCaptureProbe>(capture_probe)) {
@@ -1622,6 +1653,9 @@ void ProbeExplorer::create_exclusion_file(std::vector<std::shared_ptr<Probe>> pr
       case ProbeType::KPROBE:
         jexclude = std::dynamic_pointer_cast<KProbe>(probe)->toJson(false);
         break;
+      case ProbeType::TRACEPOINT:
+        jexclude = std::dynamic_pointer_cast<TracepointProbe>(probe)->toJson(false);
+        break;
       case ProbeType::UPROBE:
         jexclude = std::dynamic_pointer_cast<UProbe>(probe)->toJson(false);
         break;
@@ -1708,6 +1742,10 @@ std::unordered_map<std::string, std::shared_ptr<Probe>> ProbeExplorer::loadExist
               case ProbeType::KPROBE:
                 probe = std::make_shared<KProbe>();
                 probe->type = ProbeType::KPROBE;
+                break;
+              case ProbeType::TRACEPOINT:
+                probe = std::make_shared<TracepointProbe>();
+                probe->type = ProbeType::TRACEPOINT;
                 break;
               case ProbeType::CUSTOM:
                 probe = std::make_shared<CustomProbe>();
@@ -1797,6 +1835,7 @@ std::unordered_map<std::string, std::shared_ptr<Probe>> ProbeExplorer::loadExist
                 break;
               case ProbeType::SYSCALLS:
               case ProbeType::KPROBE:
+              case ProbeType::TRACEPOINT:
                 // No additional fields to load for these types
                 break;
               default:
@@ -1853,6 +1892,9 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::writeProbesToJson() {
         break;
       case ProbeType::KPROBE:
         jprobe = std::dynamic_pointer_cast<KProbe>(probe)->toJson();
+        break;
+      case ProbeType::TRACEPOINT:
+        jprobe = std::dynamic_pointer_cast<TracepointProbe>(probe)->toJson();
         break;
       case ProbeType::UPROBE:
         jprobe = std::dynamic_pointer_cast<UProbe>(probe)->toJson();

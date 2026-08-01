@@ -427,6 +427,23 @@ target_link_libraries(datacrumbs_rdma_hwts ${DATACRUMBS_PUBLIC_COMMON_LIBRARY} O
                       ZLIB::ZLIB ${CMAKE_DL_LIBS})
 install(TARGETS datacrumbs_rdma_hwts LIBRARY DESTINATION "${DATACRUMBS_UTILS_INSTALL_LIB_DIR}")
 
+# DOCA-native variant: same source with the DATACRUMBS_DOCA_HWTS block (frida-gum inline hook on the
+# DOCA CQ poll to capture the kernel-bypass fabric wire). Built only when the frida-gum devkit is
+# present (DOCA/DevX is DPU-only), so ordinary builds are unaffected.
+datacrumbs_set_default(FRIDA_GUM_DIR
+    "/home/sinurat1/projects/dpu-explainability/deps/src/bpftime/build-arm64/FridaGum-prefix/src/FridaGum")
+if(EXISTS "${FRIDA_GUM_DIR}/libfrida-gum.a")
+  add_library(datacrumbs_rdma_hwts_doca SHARED
+      "${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/utils/client/rdma_hwts.cpp")
+  target_compile_definitions(datacrumbs_rdma_hwts_doca PRIVATE DATACRUMBS_DOCA_HWTS)
+  target_include_directories(datacrumbs_rdma_hwts_doca PRIVATE "${FRIDA_GUM_DIR}")
+  target_link_libraries(datacrumbs_rdma_hwts_doca ${DATACRUMBS_PUBLIC_COMMON_LIBRARY} OpenSSL::Crypto
+                        ZLIB::ZLIB "${FRIDA_GUM_DIR}/libfrida-gum.a" ${CMAKE_DL_LIBS} pthread resolv m)
+  install(TARGETS datacrumbs_rdma_hwts_doca LIBRARY DESTINATION "${DATACRUMBS_UTILS_INSTALL_LIB_DIR}")
+else()
+  message(STATUS "frida-gum devkit not at ${FRIDA_GUM_DIR}; skipping datacrumbs_rdma_hwts_doca")
+endif()
+
 
 set(DATACRUMBS_UTILS_PROBE_CONFIGURATOR_BIN "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/datacrumbs_probe_configurator_exec")
 set(DATACRUMBS_UTILS_PROBE_CONFIGURATOR_INSTALL_BIN

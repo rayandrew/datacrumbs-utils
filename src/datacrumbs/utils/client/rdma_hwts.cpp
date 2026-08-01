@@ -31,6 +31,10 @@
 #include <string>
 #include <unordered_map>
 
+#ifdef DATACRUMBS_DOCA_HWTS
+#include "frida-gum.h"  // DOCA fabric CQE hw-ts via inline hook; DOCA-only build (see block at end)
+#endif
+
 namespace {
 
 bool hwts_on() {
@@ -98,16 +102,18 @@ const char* opcode_name(uint32_t op) {
     case IBV_WC_RDMA_WRITE: return "rdma_write";
     case IBV_WC_RDMA_READ: return "rdma_read";
     case 250: return "rdma_post";  // our WITH_IMM send marker
+    case 260: return "doca_send";  // DOCA CQE (mlx5 op 0)
+    case 261: return "doca_recv";  // DOCA CQE (mlx5 op 2/3)
     default: return "rdma_completion";
   }
 }
 
-// Emit one completion. hw==0 => cpu-tier marker (post); phc<0 => not a NIC ts. ts is the global epoch
-// in us; raw_ns/phc/aligned stay in args so the mapping is auditable and reversible.
-void emit(uint64_t hw_ns, uint64_t wr_id, uint32_t op, uint32_t imm, uint32_t qp, int phc) {
+// Write one completion record. ref_ns = global-epoch ns (0 if unaligned); raw_ns = the original
+// device timestamp, kept in args so the mapping is auditable/reversible. phc is recorded for context.
+void emit_record(uint64_t ref_ns, uint64_t raw_ns, uint64_t wr_id, uint32_t op, uint32_t imm,
+                 uint32_t qp, int phc) {
   Sink* s = g_sink;
   if (s == nullptr) return;
-  const uint64_t ref_ns = hw_ns != 0 ? s->reader.remap_hw(hw_ns, phc) : 0;
   char line[640];
   const int n = std::snprintf(
       line, sizeof(line),
@@ -115,7 +121,7 @@ void emit(uint64_t hw_ns, uint64_t wr_id, uint32_t op, uint32_t imm, uint32_t qp
       "\n",
       static_cast<unsigned long long>(s->id.fetch_add(1)), opcode_name(op), tid(), getpid(),
       static_cast<unsigned long long>(ref_ns / 1000), s->hhash.c_str(), ref_ns != 0 ? 1 : 0,
-      static_cast<unsigned long long>(hw_ns), phc, static_cast<unsigned long long>(wr_id), op, imm,
+      static_cast<unsigned long long>(raw_ns), phc, static_cast<unsigned long long>(wr_id), op, imm,
       qp);
   if (n <= 0) return;
   std::lock_guard<std::mutex> lock(s->mu);
@@ -123,19 +129,16 @@ void emit(uint64_t hw_ns, uint64_t wr_id, uint32_t op, uint32_t imm, uint32_t qp
   if (s->buf.size() >= 256 * 1024) s->flush_locked();
 }
 
-// Which PHC hardware-stamps this context's completions (the clock_id dc_timesync keys its remap on).
-// Resolved once per CQ via sysfs + one ethtool ioctl, never on the poll path. -1 if unknown.
-int phc_of_context(struct ibv_context* ctx) {
-  if (ctx == nullptr || ctx->device == nullptr) return -1;
-  static const char* (*real_name)(struct ibv_device*) = nullptr;
-  if (real_name == nullptr) {
-    real_name = (const char* (*)(struct ibv_device*))dlvsym(RTLD_NEXT, "ibv_get_device_name",
-                                                            "IBVERBS_1.1");
-    if (real_name == nullptr)
-      real_name = (const char* (*)(struct ibv_device*))dlsym(RTLD_NEXT, "ibv_get_device_name");
-  }
-  if (real_name == nullptr) return -1;
-  const char* dev = real_name(ctx->device);
+// ibverbs completion: hw is a PHC-domain ns; remap through the per-PHC dc_timesync fit (0 = cpu marker).
+void emit(uint64_t hw_ns, uint64_t wr_id, uint32_t op, uint32_t imm, uint32_t qp, int phc) {
+  Sink* s = g_sink;
+  if (s == nullptr) return;
+  emit_record(hw_ns != 0 ? s->reader.remap_hw(hw_ns, phc) : 0, hw_ns, wr_id, op, imm, qp, phc);
+}
+
+// The PHC that hardware-stamps this ibverbs device's completions (the clock_id dc_timesync keys its
+// remap on): the first netdev under the device that reports a phc_index. -1 if unknown.
+int phc_of_ibdev(const char* dev) {
   if (dev == nullptr) return -1;
   char dir[256];
   std::snprintf(dir, sizeof(dir), "/sys/class/infiniband/%s/device/net", dev);
@@ -160,6 +163,19 @@ int phc_of_context(struct ibv_context* ctx) {
   }
   closedir(d);
   return phc;
+}
+
+// Same, resolved once per CQ via the ibv_context's device name (off the poll path).
+int phc_of_context(struct ibv_context* ctx) {
+  if (ctx == nullptr || ctx->device == nullptr) return -1;
+  static const char* (*real_name)(struct ibv_device*) = nullptr;
+  if (real_name == nullptr) {
+    real_name = (const char* (*)(struct ibv_device*))dlvsym(RTLD_NEXT, "ibv_get_device_name",
+                                                            "IBVERBS_1.1");
+    if (real_name == nullptr)
+      real_name = (const char* (*)(struct ibv_device*))dlsym(RTLD_NEXT, "ibv_get_device_name");
+  }
+  return real_name != nullptr ? phc_of_ibdev(real_name(ctx->device)) : -1;
 }
 
 struct CqInfo {
@@ -294,3 +310,142 @@ __attribute__((destructor)) void rdma_hwts_fini() {
   if (s->file != nullptr) std::fclose(s->file);
 }
 }  // namespace
+
+#ifdef DATACRUMBS_DOCA_HWTS
+// DOCA fabric CQE capture. The DPU<->DPU data fabric is DOCA-RDMA (mlx5 DevX, kernel-bypass) with its
+// own hidden CQ, invisible to the ibv_create_cq path above and to any DOCA API. But
+// priv_doca_cq_poll_one(cq, out_cqe) copies the raw mlx5 CQE into arg1 and returns 0 on a hit: the NIC
+// hw timestamp is at out_cqe+48 (__be64), opcode in the high nibble of byte 63, imm at +36. We
+// inline-hook it via frida-gum and feed each completion into the same emit() path (opcode 260/261 ->
+// doca_send/doca_recv). Opt-in: DC_HWTS=1 + DC_HWTS_DOCA=1. Built only in the DOCA-native target.
+namespace {
+
+// raw(HCA free-running ns) <-> CLOCK_MONOTONIC anchor for the DOCA device. The CQE ts is the HCA
+// free-running clock (hca_core_clock 1GHz -> 1ns/tick), NOT PHC-realtime and NOT readable via
+// /dev/ptp unprivileged; but raw and MONOTONIC differ by a near-constant, so raw->mono->global (the
+// existing mono remap) aligns it. Re-sampled periodically to bound HCA<->CPU oscillator drift.
+struct DocaAnchor {
+  struct ibv_context* ctx = nullptr;
+  std::atomic<int64_t> raw_minus_mono{0};
+  std::atomic<int64_t> at_mono{0};  // MONOTONIC ns when raw_minus_mono was sampled (re-anchor timer)
+  std::atomic<bool> valid{false};
+};
+DocaAnchor g_anchor;
+
+int64_t mono_ns() {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return static_cast<int64_t>(t.tv_sec) * 1000000000LL + t.tv_nsec;
+}
+
+// Resolve verbs symbols by DEFAULT version (dlsym RTLD_DEFAULT), never an unversioned link ref, which
+// mis-binds against the versioned symbol.
+void doca_open_anchor_ctx(const char* dev) {
+  auto get_list = (struct ibv_device** (*)(int*))dlsym(RTLD_DEFAULT, "ibv_get_device_list");
+  auto get_name = (const char* (*)(struct ibv_device*))dlsym(RTLD_DEFAULT, "ibv_get_device_name");
+  auto open_dev = (struct ibv_context* (*)(struct ibv_device*))dlsym(RTLD_DEFAULT, "ibv_open_device");
+  if (get_list == nullptr || get_name == nullptr || open_dev == nullptr) return;
+  int n = 0;
+  struct ibv_device** list = get_list(&n);
+  if (list == nullptr) return;
+  for (int i = 0; i < n; ++i) {
+    const char* nm = get_name(list[i]);
+    if (nm != nullptr && std::strcmp(nm, dev) == 0) {
+      g_anchor.ctx = open_dev(list[i]);
+      break;
+    }
+  }
+}
+
+void doca_sample_anchor() {
+  if (g_anchor.ctx == nullptr) return;
+  struct ibv_values_ex v;
+  std::memset(&v, 0, sizeof(v));
+  v.comp_mask = IBV_VALUES_MASK_RAW_CLOCK;
+  // Bracket the raw read between two MONOTONIC reads and use the midpoint, so the anchor offset is
+  // free of the read-latency skew (sub-us). ibv_query_rt_values_ex is a static inline (dispatches
+  // through the ctx), so there is no exported symbol to dlsym; the ctx came from the real ibv_open.
+  const int64_t m1 = mono_ns();
+  if (ibv_query_rt_values_ex(g_anchor.ctx, &v) != 0) return;
+  const int64_t m2 = mono_ns();
+  const int64_t raw = static_cast<int64_t>(v.raw_clock.tv_sec) * 1000000000LL + v.raw_clock.tv_nsec;
+  g_anchor.raw_minus_mono.store(raw - (m1 + m2) / 2, std::memory_order_relaxed);
+  g_anchor.at_mono.store(m2, std::memory_order_relaxed);
+  g_anchor.valid.store(true, std::memory_order_relaxed);
+}
+
+struct DcDocaCall {
+  gpointer cqe;
+};
+struct _DcDocaListener {
+  GObject parent;
+};
+G_DECLARE_FINAL_TYPE(DcDocaListener, dc_doca_listener, DC, DOCA_LISTENER, GObject)
+void dc_doca_listener_iface_init(gpointer g_iface, gpointer data);
+G_DEFINE_TYPE_EXTENDED(DcDocaListener, dc_doca_listener, G_TYPE_OBJECT, 0,
+                       G_IMPLEMENT_INTERFACE(GUM_TYPE_INVOCATION_LISTENER,
+                                             dc_doca_listener_iface_init))
+
+void dc_doca_on_enter(GumInvocationListener*, GumInvocationContext* ic) {
+  DcDocaCall* d = GUM_IC_GET_INVOCATION_DATA(ic, DcDocaCall);
+  d->cqe = gum_invocation_context_get_nth_argument(ic, 1);  // arg1 = out_cqe
+}
+void dc_doca_on_leave(GumInvocationListener*, GumInvocationContext* ic) {
+  if (reinterpret_cast<intptr_t>(gum_invocation_context_get_return_value(ic)) != 0) return;
+  DcDocaCall* d = GUM_IC_GET_INVOCATION_DATA(ic, DcDocaCall);
+  if (d->cqe == nullptr) return;
+  const unsigned char* c = static_cast<const unsigned char*>(d->cqe);
+  const uint64_t hw = __builtin_bswap64(*reinterpret_cast<const volatile uint64_t*>(c + 48));
+  const uint32_t op = c[63] >> 4;  // 0 = send, 2/3 = recv
+  const uint32_t imm = __builtin_bswap32(*reinterpret_cast<const volatile uint32_t*>(c + 36));
+  // Align the HCA free-running ts onto the global epoch via the raw->mono anchor + the mono remap.
+  // Without an anchor (DC_HWTS_DOCA_DEV unset / rt_values unsupported) ref=0 and raw_ns is kept.
+  uint64_t ref = 0;
+  Sink* s = g_sink;
+  if (s != nullptr && g_anchor.valid.load(std::memory_order_relaxed)) {
+    // Time-based re-anchor (not count-based: low-rate DOCA would never re-fire): >50ms since the last
+    // anchor bounds the ~1ppm HCA<->CPU drift to <=50ns, so the mapping stays sub-us.
+    if (mono_ns() - g_anchor.at_mono.load(std::memory_order_relaxed) > 50000000LL) doca_sample_anchor();
+    const int64_t mono = static_cast<int64_t>(hw) - g_anchor.raw_minus_mono.load(std::memory_order_relaxed);
+    if (mono > 0) ref = s->reader.remap(static_cast<uint64_t>(mono));
+  }
+  emit_record(ref, hw, 0, op == 0 ? 260 : 261, imm, 0, -1);
+}
+void dc_doca_listener_iface_init(gpointer g_iface, gpointer) {
+  auto* i = static_cast<GumInvocationListenerInterface*>(g_iface);
+  i->on_enter = dc_doca_on_enter;
+  i->on_leave = dc_doca_on_leave;
+}
+void dc_doca_listener_class_init(DcDocaListenerClass*) {}
+void dc_doca_listener_init(DcDocaListener*) {}
+
+// LD_PRELOAD ctors run after NEEDED libs map, so libdoca_common is present. No-op unless enabled.
+__attribute__((constructor)) void dc_doca_install() {
+  if (!hwts_on()) return;
+  const char* e = std::getenv("DC_HWTS_DOCA");
+  if (e == nullptr || *e == '\0' || e[0] == '0') return;
+  std::call_once(g_once, sink_init);
+  const char* dev = std::getenv("DC_HWTS_DOCA_DEV");  // e.g. mlx5_2; enables global-epoch alignment
+  if (dev != nullptr && *dev != '\0') {
+    doca_open_anchor_ctx(dev);
+    doca_sample_anchor();
+  }
+  gum_init_embedded();
+  gpointer target = reinterpret_cast<gpointer>(
+      gum_module_find_export_by_name("libdoca_common.so", "priv_doca_cq_poll_one"));
+  if (target == nullptr) {  // internal symbol may not export -> known offset for this build
+    GumAddress base = gum_module_find_base_address("libdoca_common.so");
+    if (base != 0) target = GSIZE_TO_POINTER(base + 0x57934);
+  }
+  if (target == nullptr) {
+    fprintf(stderr, "[dc-hwts] DC_HWTS_DOCA: priv_doca_cq_poll_one not found\n");
+    return;
+  }
+  GumInterceptor* it = gum_interceptor_obtain();
+  GObject* lis = static_cast<GObject*>(g_object_new(dc_doca_listener_get_type(), nullptr));
+  gum_interceptor_begin_transaction(it);
+  gum_interceptor_attach(it, target, GUM_INVOCATION_LISTENER(lis), nullptr);
+  gum_interceptor_end_transaction(it);
+}
+}  // namespace
+#endif  // DATACRUMBS_DOCA_HWTS

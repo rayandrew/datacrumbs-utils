@@ -1,6 +1,6 @@
 // datacrumbs global-clock shim: LD_PRELOAD alongside dftracer (or any tool that timestamps with
 // gettimeofday) so its events land on the dc_timesync global cross-node epoch and merge with the
-// datacrumbs server trace. Interposes gettimeofday only -- dftracer is used unmodified. When no
+// datacrumbs server trace. Interposes gettimeofday only - dftracer is used unmodified. When no
 // snapshot is mapped (or no valid fit), falls back to the real gettimeofday so nothing breaks.
 //
 // This shifts every gettimeofday caller in the process to the global epoch, which is a PHC-synced

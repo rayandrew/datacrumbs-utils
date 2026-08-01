@@ -418,6 +418,15 @@ add_library(datacrumbs_dftracer_clock SHARED
 target_link_libraries(datacrumbs_dftracer_clock ${DATACRUMBS_PUBLIC_COMMON_LIBRARY} ${CMAKE_DL_LIBS})
 install(TARGETS datacrumbs_dftracer_clock LIBRARY DESTINATION "${DATACRUMBS_UTILS_INSTALL_LIB_DIR}")
 
+# RDMA hw-timestamp capture: LD_PRELOAD upgrades ibv_create_cq CQs to timestamped extended CQs and
+# emits per-completion NIC hw timestamps on the global epoch. Uses dlvsym for verbs symbols (no
+# -libverbs link); needs infiniband/verbs.h in the sysroot. Enable at runtime with DC_HWTS=1.
+add_library(datacrumbs_rdma_hwts SHARED
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/utils/client/rdma_hwts.cpp")
+target_link_libraries(datacrumbs_rdma_hwts ${DATACRUMBS_PUBLIC_COMMON_LIBRARY} OpenSSL::Crypto
+                      ZLIB::ZLIB ${CMAKE_DL_LIBS})
+install(TARGETS datacrumbs_rdma_hwts LIBRARY DESTINATION "${DATACRUMBS_UTILS_INSTALL_LIB_DIR}")
+
 
 set(DATACRUMBS_UTILS_PROBE_CONFIGURATOR_BIN "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/datacrumbs_probe_configurator_exec")
 set(DATACRUMBS_UTILS_PROBE_CONFIGURATOR_INSTALL_BIN

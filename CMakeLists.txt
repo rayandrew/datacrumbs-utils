@@ -30,6 +30,7 @@ endif()
 find_package(datacrumbs CONFIG REQUIRED)
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 find_package(OpenSSL REQUIRED)
+find_package(ZLIB REQUIRED)
 find_package(yaml-cpp REQUIRED)
 set(DATACRUMBS_UTILS_PYTHON_EXECUTABLE "${Python3_EXECUTABLE}")
 
@@ -401,6 +402,14 @@ add_library(datacrumbs_plugin_pmu MODULE
 target_link_libraries(datacrumbs_plugin_pmu ${DATACRUMBS_PUBLIC_COMMON_LIBRARY})
 install(TARGETS datacrumbs_plugin_pmu
         LIBRARY DESTINATION "${DATACRUMBS_UTILS_INSTALL_LIB_DIR}/datacrumbs/plugins")
+
+# interposition client: LD_PRELOAD lib that traces libc I/O in userspace (no uprobe/server) and
+# writes its own global-epoch .pfw, merged with the server trace at collect.
+add_library(datacrumbs_interpose SHARED
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/utils/client/interpose.cpp")
+target_link_libraries(datacrumbs_interpose ${DATACRUMBS_PUBLIC_COMMON_LIBRARY} OpenSSL::Crypto
+                      ZLIB::ZLIB ${CMAKE_DL_LIBS})
+install(TARGETS datacrumbs_interpose LIBRARY DESTINATION "${DATACRUMBS_UTILS_INSTALL_LIB_DIR}")
 
 
 set(DATACRUMBS_UTILS_PROBE_CONFIGURATOR_BIN "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/datacrumbs_probe_configurator_exec")

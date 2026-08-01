@@ -15,5 +15,5 @@ int main(int argc, char** argv) {
 
   timer.pauseTime();
   DC_LOG_PRINT("Elapsed time in Probe Configurator: %f seconds", timer.getElapsedTime());
-  return explorer.has_invalid_probes_ ? 1 : 0;
+  return (explorer.has_invalid_probes_ || explorer.signing_failed_) ? 1 : 0;
 }

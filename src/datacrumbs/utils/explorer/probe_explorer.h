@@ -84,6 +84,7 @@ class ProbeExplorer {
    * @brief Indicates whether extraction/validation encountered invalid probe candidates.
    */
   bool has_invalid_probes_ = false;
+  bool signing_failed_ = false;
 
  private:
   /**

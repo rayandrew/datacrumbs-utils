@@ -1912,6 +1912,7 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::writeProbesToJson() {
   if (!signed_ok) {
     DC_LOG_ERROR("Failed to sign probes through datacrumbs_probe_manager service: %s",
                  signing_error.c_str());
+    signing_failed_ = true;
     json_object_put(root);
     json_object_put(jarray);
     return probes;
@@ -1927,6 +1928,7 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::writeProbesToJson() {
 
   if (!datacrumbs::probe_file::write_gzip_file(configManager_->probe_file_path, signed_payload)) {
     DC_LOG_ERROR("Failed to open file: %s", configManager_->probe_file_path.c_str());
+    signing_failed_ = true;
   } else {
     DC_LOG_INFO("Signed probe file written: %s", configManager_->probe_file_path.c_str());
   }

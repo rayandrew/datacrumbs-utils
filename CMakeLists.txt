@@ -411,6 +411,13 @@ target_link_libraries(datacrumbs_interpose ${DATACRUMBS_PUBLIC_COMMON_LIBRARY} O
                       ZLIB::ZLIB ${CMAKE_DL_LIBS})
 install(TARGETS datacrumbs_interpose LIBRARY DESTINATION "${DATACRUMBS_UTILS_INSTALL_LIB_DIR}")
 
+# dftracer clock shim: LD_PRELOAD with dftracer (unmodified) so its gettimeofday timestamps become
+# the dc_timesync global epoch. Reuses the shared timesync reader.
+add_library(datacrumbs_dftracer_clock SHARED
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/utils/client/dftracer_clock.cpp")
+target_link_libraries(datacrumbs_dftracer_clock ${DATACRUMBS_PUBLIC_COMMON_LIBRARY} ${CMAKE_DL_LIBS})
+install(TARGETS datacrumbs_dftracer_clock LIBRARY DESTINATION "${DATACRUMBS_UTILS_INSTALL_LIB_DIR}")
+
 
 set(DATACRUMBS_UTILS_PROBE_CONFIGURATOR_BIN "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/datacrumbs_probe_configurator_exec")
 set(DATACRUMBS_UTILS_PROBE_CONFIGURATOR_INSTALL_BIN

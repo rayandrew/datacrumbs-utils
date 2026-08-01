@@ -1641,6 +1641,9 @@ void ProbeExplorer::create_exclusion_file(std::vector<std::shared_ptr<Probe>> pr
       case ProbeType::CUSTOM:
         jexclude = std::dynamic_pointer_cast<CustomProbe>(probe)->toJson(false);
         break;
+      case ProbeType::TRACEPOINT:
+        jexclude = std::dynamic_pointer_cast<TracepointProbe>(probe)->toJson(false);
+        break;
       default:
         DC_LOG_ERROR("Unknown probe type encountered.");
         continue;  // Skip unknown types
@@ -1722,6 +1725,10 @@ std::unordered_map<std::string, std::shared_ptr<Probe>> ProbeExplorer::loadExist
               case ProbeType::CUSTOM:
                 probe = std::make_shared<CustomProbe>();
                 probe->type = ProbeType::CUSTOM;
+                break;
+              case ProbeType::TRACEPOINT:
+                probe = std::make_shared<TracepointProbe>();
+                probe->type = ProbeType::TRACEPOINT;
                 break;
               default:
                 DC_LOG_WARN("Unknown probe type '%d' for probe '%s'", static_cast<int>(probe_type),
@@ -1867,6 +1874,9 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::writeProbesToJson() {
         break;
       case ProbeType::CUSTOM:
         jprobe = std::dynamic_pointer_cast<CustomProbe>(probe)->toJson();
+        break;
+      case ProbeType::TRACEPOINT:
+        jprobe = std::dynamic_pointer_cast<TracepointProbe>(probe)->toJson();
         break;
       default:
         DC_LOG_ERROR("Unknown probe type encountered.");

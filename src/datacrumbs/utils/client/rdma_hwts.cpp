@@ -398,16 +398,22 @@ void dc_doca_on_leave(GumInvocationListener*, GumInvocationContext* ic) {
   const uint64_t hw = __builtin_bswap64(*reinterpret_cast<const volatile uint64_t*>(c + 48));
   const uint32_t op = c[63] >> 4;  // 0 = send, 2/3 = recv
   const uint32_t imm = __builtin_bswap32(*reinterpret_cast<const volatile uint32_t*>(c + 36));
-  // Align the HCA free-running ts onto the global epoch via the raw->mono anchor + the mono remap.
-  // Without an anchor (DC_HWTS_DOCA_DEV unset / rt_values unsupported) ref=0 and raw_ns is kept.
+  // Prefer the daemon's raw->global fit (drift-free, no local clock work). Fall back to the local
+  // raw->mono anchor when the daemon publishes no raw fit (DC_TIMESYNC_RAW_DEV unset). ref=0 when
+  // neither is available -> raw_ns is kept unaligned.
   uint64_t ref = 0;
   Sink* s = g_sink;
-  if (s != nullptr && g_anchor.valid.load(std::memory_order_relaxed)) {
-    // Time-based re-anchor (not count-based: low-rate DOCA would never re-fire): >50ms since the last
-    // anchor bounds the ~1ppm HCA<->CPU drift to <=50ns, so the mapping stays sub-us.
-    if (mono_ns() - g_anchor.at_mono.load(std::memory_order_relaxed) > 50000000LL) doca_sample_anchor();
-    const int64_t mono = static_cast<int64_t>(hw) - g_anchor.raw_minus_mono.load(std::memory_order_relaxed);
-    if (mono > 0) ref = s->reader.remap(static_cast<uint64_t>(mono));
+  if (s != nullptr) {
+    ref = s->reader.remap_raw(hw);
+    if (ref == 0 && g_anchor.valid.load(std::memory_order_relaxed)) {
+      // Time-based re-anchor (not count-based: low-rate DOCA would never re-fire): >50ms bounds the
+      // ~1ppm HCA<->CPU drift to <=50ns, so the fallback mapping stays sub-us.
+      if (mono_ns() - g_anchor.at_mono.load(std::memory_order_relaxed) > 50000000LL)
+        doca_sample_anchor();
+      const int64_t mono =
+          static_cast<int64_t>(hw) - g_anchor.raw_minus_mono.load(std::memory_order_relaxed);
+      if (mono > 0) ref = s->reader.remap(static_cast<uint64_t>(mono));
+    }
   }
   emit_record(ref, hw, 0, op == 0 ? 260 : 261, imm, 0, -1);
 }

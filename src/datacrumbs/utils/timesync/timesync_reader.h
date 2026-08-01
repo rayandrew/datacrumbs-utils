@@ -63,6 +63,19 @@ class Reader {
     return apply_fit(s, static_cast<long long>(hw_ns) + delta);
   }
 
+  // Remap an HCA free-running raw timestamp (e.g. a DOCA fabric CQE ts) onto the global epoch via the
+  // daemon's published raw->synced-PHC fit. Drift-free (the fit's skew absorbs the HCA<->PHC servo),
+  // so no local anchor is needed. Returns 0 when no raw fit is published or no valid fit - callers
+  // must NOT treat 0 as an aligned time.
+  unsigned long long remap_raw(unsigned long long raw_ns) const {
+    dc_timesync_snapshot s;
+    if (!read(&s) || !s.valid || !s.raw_valid) return 0;
+    const long long drift = static_cast<long long>(static_cast<__int128>(s.raw_skew_ppb) *
+                                                   (static_cast<long long>(raw_ns) - s.raw_anchor_ns) /
+                                                   1000000000LL);
+    return apply_fit(s, static_cast<long long>(raw_ns) + s.raw_to_synced_ns + drift);
+  }
+
  private:
   // offset + skew*(t - anchor) about the synced-PHC value t.
   static unsigned long long apply_fit(const dc_timesync_snapshot& s, long long synced) {

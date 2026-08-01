@@ -22,6 +22,7 @@
 #include <datacrumbs/common/dc_timesync_snapshot.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <infiniband/verbs.h>
 #include <linux/errqueue.h>
 #include <linux/ethtool.h>
 #include <linux/net_tstamp.h>
@@ -272,6 +273,81 @@ static void fill_clock_registry(struct dc_timesync_snapshot* v, int synced_phc) 
   }
 }
 
+// ---- HCA free-running raw clock <-> synced PHC sliding fit (optional) ----
+// The DOCA fabric CQE hw ts is the HCA free-running clock, which /dev/ptp does not expose. When the
+// daemon is told the fabric ib device (DC_TIMESYNC_RAW_DEV), it reads that same clock via
+// ibv_query_rt_values_ex each cycle and publishes a raw->synced-PHC fit, so an unprivileged consumer
+// (the DOCA CQE hook) maps a completion ts straight onto the global epoch with no local anchor.
+static struct ibv_context* g_raw_ctx = NULL;
+
+static void raw_open(const char* dev) {
+  int n = 0;
+  struct ibv_device** list = ibv_get_device_list(&n);
+  if (!list) return;
+  for (int i = 0; i < n; i++)
+    if (strcmp(ibv_get_device_name(list[i]), dev) == 0) {
+      g_raw_ctx = ibv_open_device(list[i]);
+      break;
+    }
+  ibv_free_device_list(list);
+  if (!g_raw_ctx) fprintf(stderr, "DC_TIMESYNC_RAW_DEV=%s: no such ib device\n", dev);
+}
+
+static uint64_t raw_now(void) {
+  if (!g_raw_ctx) return 0;
+  struct ibv_values_ex v = {0};
+  v.comp_mask = IBV_VALUES_MASK_RAW_CLOCK;
+  if (ibv_query_rt_values_ex(g_raw_ctx, &v) != 0) return 0;
+  return ns(&v.raw_clock);
+}
+
+// Sliding window of (raw, synced_phc - raw) samples; a least-squares line gives the fit the reader
+// extrapolates from, so its skew term absorbs the ~4 ppm HCA<->PHC servo drift (drift-free).
+#define RAWWIN 16
+static uint64_t raw_w_raw[RAWWIN];
+static int64_t raw_w_d[RAWWIN];
+static int raw_n = 0, raw_i = 0;
+
+// Read the HCA raw clock bracketed around a synced-PHC read, so the (phc - raw) sample is free of the
+// read gap: raw and phc share the NIC oscillator, so the bracket midpoint pins them to one instant.
+// Returns 0 (no fit) when the raw device is not configured.
+static uint64_t raw_paired(int synced_phc, uint64_t* phc_out) {
+  uint64_t a = raw_now();
+  if (a == 0) return 0;
+  int64_t br = phc_mono_offset(synced_phc, phc_out);
+  uint64_t b = raw_now();
+  (void)br;
+  return (a + b) / 2;
+}
+
+static void raw_fit_update(uint64_t raw, uint64_t phc_synced, struct dc_timesync_snapshot* v) {
+  if (!g_raw_ctx || raw == 0 || phc_synced == 0) return;
+  raw_w_raw[raw_i] = raw;
+  raw_w_d[raw_i] = (int64_t)(phc_synced - raw);
+  raw_i = (raw_i + 1) % RAWWIN;
+  if (raw_n < RAWWIN) raw_n++;
+  if (raw_n < 2) return;
+  int base = (raw_i + RAWWIN - raw_n) % RAWWIN;
+  uint64_t t0 = raw_w_raw[base];
+  double sx = 0, sy = 0, sxx = 0, sxy = 0;
+  for (int j = 0; j < raw_n; j++) {
+    int idx = (base + j) % RAWWIN;
+    double x = (double)((int64_t)(raw_w_raw[idx] - t0)) / 1e9;
+    double y = (double)raw_w_d[idx];
+    sx += x;
+    sy += y;
+    sxx += x * x;
+    sxy += x * y;
+  }
+  double denom = raw_n * sxx - sx * sx;
+  double b = denom != 0 ? (raw_n * sxy - sx * sy) / denom : 0;
+  double a = (sy - b * sx) / raw_n;
+  v->raw_anchor_ns = (int64_t)t0;
+  v->raw_to_synced_ns = (int64_t)a;
+  v->raw_skew_ppb = (int64_t)b;
+  v->raw_valid = 1;
+}
+
 // Handle one responder turn: wait (up to the socket's SO_RCVTIMEO) for a REQ and
 // reply with RESP + a FUP carrying our RX/TX hw timestamps. Returns 1 if a REQ
 // was served, 0 on timeout (lets a caller wake periodically to do other work).
@@ -382,6 +458,10 @@ static void publish(struct dc_timesync_snapshot* s, const struct dc_timesync_sna
   s->n_clocks = v->n_clocks;
   s->synced_phc_index = v->synced_phc_index;
   for (uint32_t i = 0; i < v->n_clocks && i < DC_TIMESYNC_MAX_CLOCKS; i++) s->clocks[i] = v->clocks[i];
+  s->raw_valid = v->raw_valid;
+  s->raw_anchor_ns = v->raw_anchor_ns;
+  s->raw_to_synced_ns = v->raw_to_synced_ns;
+  s->raw_skew_ppb = v->raw_skew_ppb;
   __atomic_thread_fence(__ATOMIC_RELEASE);
   __atomic_store_n(&s->seq, next, __ATOMIC_RELAXED);  // even: consistent
 }
@@ -421,6 +501,9 @@ int main(int argc, char** argv) {
       printf("    /dev/ptp%-2d valid=%u delta_to_synced=%lld ns%s\n", shm->clocks[i].phc_index,
              shm->clocks[i].valid, (long long)shm->clocks[i].delta_to_synced_ns,
              shm->clocks[i].phc_index == shm->synced_phc_index ? "  (synced)" : "");
+    printf("  raw fit: valid=%u anchor=%lld raw_to_synced=%lld ns skew=%lld ppb\n", shm->raw_valid,
+           (long long)shm->raw_anchor_ns, (long long)shm->raw_to_synced_ns,
+           (long long)shm->raw_skew_ppb);
     return 0;
   }
 
@@ -450,6 +533,8 @@ int main(int argc, char** argv) {
     if (!shm) return 1;
     printf("# daemon self=%u ref=%u cadence=%dms snapshot=%s\n", self_id, ref_id, cadence_ms,
            snap_path);
+    const char* raw_dev = getenv("DC_TIMESYNC_RAW_DEV");  // fabric ib device -> publish raw-clock fit
+    if (raw_dev && *raw_dev) raw_open(raw_dev);
 
     if (self_id == ref_id) {
       // reference node: serve initiators + publish an identity snapshot (its PHC
@@ -471,6 +556,8 @@ int main(int argc, char** argv) {
         v.anchor_phc_ns = (int64_t)phc_ref;
         v.updated_mono_ns = now;
         fill_clock_registry(&v, phc);
+        uint64_t raw_phc = 0, raw = raw_paired(phc, &raw_phc);
+        raw_fit_update(raw, raw_phc, &v);
         publish(shm, &v);
         last_pub = now;
       }
@@ -539,6 +626,8 @@ int main(int argc, char** argv) {
           v.updated_mono_ns = mono_ns();
           v.residual_rms_ns = __builtin_sqrt(var / wn);
           fill_clock_registry(&v, phc);
+          uint64_t raw_phc = 0, raw = raw_paired(phc, &raw_phc);
+          raw_fit_update(raw, raw_phc, &v);
           publish(shm, &v);
         }
       }

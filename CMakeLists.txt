@@ -380,6 +380,12 @@ target_link_libraries(datacrumbs_probe_configurator ${DATACRUMBS_PUBLIC_COMMON_L
 add_dependencies(datacrumbs_probe_configurator datacrumbs_client clean_all)
 install(TARGETS datacrumbs_probe_configurator RUNTIME DESTINATION "${DATACRUMBS_INSTALL_BINARYDIR}")
 
+# dc_timesync daemon: HW-timestamped UDP exchange per DPU; publishes the seqlock snapshot the server
+# reads to remap events onto a shared cross-node axis. Standalone (libm for the line fit).
+add_executable(dc_timesync "${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/utils/timesync/dc_timesync.c")
+target_link_libraries(dc_timesync ${DATACRUMBS_PUBLIC_COMMON_LIBRARY} m)
+install(TARGETS dc_timesync RUNTIME DESTINATION "${DATACRUMBS_INSTALL_BINARYDIR}")
+
 
 set(DATACRUMBS_UTILS_PROBE_CONFIGURATOR_BIN "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/datacrumbs_probe_configurator_exec")
 set(DATACRUMBS_UTILS_PROBE_CONFIGURATOR_INSTALL_BIN

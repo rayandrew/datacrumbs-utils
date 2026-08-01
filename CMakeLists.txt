@@ -386,6 +386,14 @@ add_executable(dc_timesync "${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/utils/tim
 target_link_libraries(dc_timesync ${DATACRUMBS_PUBLIC_COMMON_LIBRARY} m)
 install(TARGETS dc_timesync RUNTIME DESTINATION "${DATACRUMBS_INSTALL_BINARYDIR}")
 
+# timesync remap plugin: dlopen'd by the server (DATACRUMBS_PLUGINS) to remap events onto the shared
+# axis the dc_timesync daemon publishes. A MODULE (load-only, no link-time consumers).
+add_library(datacrumbs_plugin_timesync MODULE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/utils/plugins/timesync/timesync_remap.cpp")
+target_link_libraries(datacrumbs_plugin_timesync ${DATACRUMBS_PUBLIC_COMMON_LIBRARY})
+install(TARGETS datacrumbs_plugin_timesync
+        LIBRARY DESTINATION "${DATACRUMBS_UTILS_INSTALL_LIB_DIR}/datacrumbs/plugins")
+
 
 set(DATACRUMBS_UTILS_PROBE_CONFIGURATOR_BIN "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/datacrumbs_probe_configurator_exec")
 set(DATACRUMBS_UTILS_PROBE_CONFIGURATOR_INSTALL_BIN

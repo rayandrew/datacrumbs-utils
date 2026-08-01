@@ -14,6 +14,7 @@
 #include <datacrumbs/utils/explorer/mechanism/elf_capture.h>
 #include <datacrumbs/utils/explorer/mechanism/header_capture.h>
 #include <datacrumbs/utils/explorer/mechanism/ksym_capture.h>
+#include <datacrumbs/utils/explorer/mechanism/tracepoint_capture.h>
 #include <datacrumbs/utils/explorer/mechanism/usdt_functions.h>
 
 // dependency libraries

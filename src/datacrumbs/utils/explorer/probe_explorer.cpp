@@ -21,6 +21,14 @@
 #include <thread>
 #include <unordered_map>
 
+// Singleton statics for TracepointCapture (mirrors ksym_capture.cpp for KSymCapture); the mechanism
+// is header-only, so its sole consumer defines them here.
+template <>
+std::shared_ptr<datacrumbs::TracepointCapture>
+    datacrumbs::Singleton<datacrumbs::TracepointCapture>::instance = nullptr;
+template <>
+bool datacrumbs::Singleton<datacrumbs::TracepointCapture>::stop_creating_instances = false;
+
 namespace {
 
 std::string probe_signing_payload(json_object* summary, json_object* categories) {
@@ -46,6 +54,8 @@ const char* probe_type_to_string(datacrumbs::ProbeType type) {
       return "usdt";
     case datacrumbs::ProbeType::CUSTOM:
       return "custom";
+    case datacrumbs::ProbeType::TRACEPOINT:
+      return "tracepoint";
   }
   return "unknown";
 }
@@ -62,6 +72,8 @@ const char* capture_type_to_string(datacrumbs::CaptureType type) {
       return "usdt";
     case datacrumbs::CaptureType::CUSTOM:
       return "custom";
+    case datacrumbs::CaptureType::TRACEPOINT:
+      return "tracepoint";
   }
   return "unknown";
 }
@@ -1150,6 +1162,12 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::extractProbes() {
             }
           }
           break;
+        case CaptureType::TRACEPOINT:
+          DC_LOG_INFO("Extracting kernel tracepoint probes...");
+          result.function_names =
+              datacrumbs::Singleton<TracepointCapture>::get_instance()->getFunctionsByRegex(
+                  capture_probe->regex);  // "category:name"; no BTF signatures for tracepoints
+          break;
         case CaptureType::CUSTOM:
           DC_LOG_INFO("Extracting custom probes...");
           if (auto customProbe = std::static_pointer_cast<CustomCaptureProbe>(capture_probe)) {
@@ -1234,6 +1252,9 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::extractProbes() {
         break;
       case ProbeType::CUSTOM:
         probe = std::make_shared<CustomProbe>();
+        break;
+      case ProbeType::TRACEPOINT:
+        probe = std::make_shared<TracepointProbe>();
         break;
       default:
         DC_LOG_ERROR("Unknown probe type encountered in extractProbes()");
@@ -1348,6 +1369,8 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::extractProbes() {
     }
 
     probe->name = capture_probe->name;
+    probe->trace_event_type = capture_probe->trace_event_type;  // .pfw domain
+    probe->system_wide = capture_probe->system_wide;            // tracepoint pid-gate opt-out
 
     // For syscall probes, normalize to base syscall names expected by attach_ksyscall.
     if (capture_probe->probe_type == ProbeType::SYSCALLS) {
@@ -1455,6 +1478,7 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::extractProbes() {
         }
         break;
       }
+      case CaptureType::TRACEPOINT:  // same kernel-name dedup as KSYM (KernelCaptureProbe)
       case CaptureType::KSYM: {
         DC_LOG_INFO("Deduplicating kernel symbol probes...");
         if (auto ksymProbe = std::static_pointer_cast<KernelCaptureProbe>(capture_probe)) {

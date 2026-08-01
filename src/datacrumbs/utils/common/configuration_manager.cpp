@@ -352,6 +352,15 @@ ConfigurationManager::ConfigurationManager(int argc, char** argv, bool load_capt
                 probe = usdt_probe;
                 break;
               }
+              case CaptureType::TRACEPOINT: {
+                auto tp_probe = std::make_shared<KernelCaptureProbe>(CaptureType::TRACEPOINT);
+                if (!probe_node["regex"]) {
+                  throw std::invalid_argument("Regex is required for TRACEPOINT capture type.");
+                }
+                tp_probe->regex = probe_node["regex"].as<std::string>();
+                probe = tp_probe;
+                break;
+              }
               case CaptureType::CUSTOM: {
                 auto custom_probe = std::make_shared<CustomCaptureProbe>();
                 if (!probe_node["file"] || !probe_node["probes"]) {
@@ -385,6 +394,11 @@ ConfigurationManager::ConfigurationManager(int argc, char** argv, bool load_capt
             if (probe_node["regex"]) {
               probe->regex = probe_node["regex"].as<std::string>();
             }
+            if (probe_node["trace_event_type"]) {
+              probe->trace_event_type = probe_node["trace_event_type"].as<std::string>();
+            }
+            probe->system_wide =
+                probe_node["system_wide"] ? probe_node["system_wide"].as<bool>() : false;
             this->capture_probes.push_back(probe);
           }
         }

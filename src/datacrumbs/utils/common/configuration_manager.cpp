@@ -399,6 +399,8 @@ ConfigurationManager::ConfigurationManager(int argc, char** argv, bool load_capt
             }
             probe->system_wide =
                 probe_node["system_wide"] ? probe_node["system_wide"].as<bool>() : false;
+            probe->aggregate =
+                probe_node["aggregate"] ? probe_node["aggregate"].as<bool>() : false;
             this->capture_probes.push_back(probe);
           }
         }

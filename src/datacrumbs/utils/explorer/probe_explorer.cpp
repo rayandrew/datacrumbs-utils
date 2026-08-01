@@ -1371,6 +1371,7 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::extractProbes() {
     probe->name = capture_probe->name;
     probe->trace_event_type = capture_probe->trace_event_type;  // .pfw domain
     probe->system_wide = capture_probe->system_wide;            // tracepoint pid-gate opt-out
+    probe->aggregate = capture_probe->aggregate;               // count/duration instead of events
 
     // For syscall probes, normalize to base syscall names expected by attach_ksyscall.
     if (capture_probe->probe_type == ProbeType::SYSCALLS) {

@@ -394,6 +394,14 @@ target_link_libraries(datacrumbs_plugin_timesync ${DATACRUMBS_PUBLIC_COMMON_LIBR
 install(TARGETS datacrumbs_plugin_timesync
         LIBRARY DESTINATION "${DATACRUMBS_UTILS_INSTALL_LIB_DIR}/datacrumbs/plugins")
 
+# pmu plugin: opens the hw counters (DATACRUMBS_HW_COUNTERS) and names the per-event deltas the core
+# BPF captures. Core does the capture-time read; this plugin owns the counter policy.
+add_library(datacrumbs_plugin_pmu MODULE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/utils/plugins/pmu/pmu_plugin.cpp")
+target_link_libraries(datacrumbs_plugin_pmu ${DATACRUMBS_PUBLIC_COMMON_LIBRARY})
+install(TARGETS datacrumbs_plugin_pmu
+        LIBRARY DESTINATION "${DATACRUMBS_UTILS_INSTALL_LIB_DIR}/datacrumbs/plugins")
+
 
 set(DATACRUMBS_UTILS_PROBE_CONFIGURATOR_BIN "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/datacrumbs_probe_configurator_exec")
 set(DATACRUMBS_UTILS_PROBE_CONFIGURATOR_INSTALL_BIN

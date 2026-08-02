@@ -179,10 +179,18 @@ std::string run_command(const std::string& command) {
 
 std::string extract_quoted_value(const std::string& line) {
   const auto first_quote = line.find('"');
-  if (first_quote == std::string::npos) return "";
-  const auto second_quote = line.find('"', first_quote + 1);
-  if (second_quote == std::string::npos) return "";
-  return line.substr(first_quote + 1, second_quote - first_quote - 1);
+  if (first_quote != std::string::npos) {
+    const auto second_quote = line.find('"', first_quote + 1);
+    if (second_quote != std::string::npos)
+      return line.substr(first_quote + 1, second_quote - first_quote - 1);
+  }
+  // readelf omits quotes (`DW_AT_name : name`, or `... (indirect string, offset: N): name`); take
+  // the value after the last ": " so both forms and the quoted (llvm-dwarfdump) form all work.
+  const auto sep = line.rfind(": ");
+  if (sep == std::string::npos) return "";
+  std::string v = line.substr(sep + 2);
+  while (!v.empty() && (v.back() == ' ' || v.back() == '\t' || v.back() == '\r')) v.pop_back();
+  return v;
 }
 
 std::string format_progress(size_t completed, size_t total) {
@@ -399,7 +407,9 @@ extract_dwarf_function_signatures(const std::string& elf_path,
     }
 
     if (current_function.level >= 0) {
-      if (line.find("DW_AT_name") != std::string::npos) {
+      // Only the first DW_AT_name (the subprogram's own, before any child DIE) is the function name;
+      // nested DW_TAG_variable/formal_parameter names must not overwrite it.
+      if (line.find("DW_AT_name") != std::string::npos && current_function.name.empty()) {
         current_function.name = extract_quoted_value(line);
         current_function_needed = !filter_to_target_names ||
                                   target_names.find(current_function.name) != target_names.end();
@@ -434,7 +444,8 @@ extract_source_backed_dwarf_function_signatures(const std::string& elf_path,
   const std::string output =
       run_command("llvm-dwarfdump --debug-info " + shell_escape(elf_path) + " 2>/dev/null");
   if (output.empty()) {
-    return signatures;
+    // llvm-dwarfdump absent (e.g. the air-gapped DPU) -> fall back to the readelf-based extractor.
+    return extract_dwarf_function_signatures(elf_path, function_names);
   }
 
   std::istringstream stream(output);

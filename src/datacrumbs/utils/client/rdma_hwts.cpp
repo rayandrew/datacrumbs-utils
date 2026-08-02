@@ -1,11 +1,16 @@
 // RDMA hardware-timestamp capture (LD_PRELOAD, DC_HWTS=1). RDMA poll is kernel-bypass and inlined,
 // so neither eBPF nor plain interposition can time the wire; we upgrade each ibv_create_cq CQ to a
 // timestamped extended CQ, hijack context->ops.poll_cq, and per completion write a COMPLETE .pfw
-// record with the NIC hw ts remapped onto the dc_timesync global epoch (merges with the server trace).
+// record with the NIC hw ts remapped onto the dc_timesync global epoch (merges with the server
+// trace).
 //
-// Only the proven-safe legacy ibv_create_cq path is ported. The inline ibv_create_cq_ex ops-table
-// hook is deliberately omitted (it segfaulted apps in ibv_modify_qp), as are the opt-in
-// post/doorbell/uprobe/CSV paths; an app building its CQ only via ibv_create_cq_ex is uncaptured.
+// The inline ibv_create_cq_ex ops-table hook is deliberately omitted (it segfaulted apps in
+// ibv_modify_qp by substituting the CQ), so an app building its CQ only via ibv_create_cq_ex is
+// uncaptured. Send posts are marked opcode 250 (legacy ibv_post_send via post_send_hook; modern
+// ibv_wr_send via the guarded create_qp_ex ops hook, opt-in DC_HWTS_POSTHOOK), and the ibv_wr
+// doorbell is marked opcode 251 (DC_HWTS_DOORBELL). DC_HWTS_SAMPLE=N thins data-plane completions
+// (markers exempt) so .pfw stays the one format; DC_HWTS_UPROBE adds the per-completion uprobe
+// path.
 
 #define _GNU_SOURCE
 #include <arpa/inet.h>
@@ -35,6 +40,9 @@
 #include "frida-gum.h"  // DOCA fabric CQE hw-ts via inline hook; DOCA-only build (see block at end)
 #endif
 
+// Server-uprobe target (opt-in DC_HWTS_UPROBE); defined below, called from the poll bridge.
+extern "C" void datacrumbs_rdma_completion(uint64_t, uint64_t, uint32_t, uint32_t, uint32_t);
+
 namespace {
 
 bool hwts_on() {
@@ -51,6 +59,42 @@ long tid() {
   if (t == 0) t = static_cast<long>(syscall(SYS_gettid));
   return t;
 }
+
+uint64_t mono_ns() {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return static_cast<uint64_t>(t.tv_sec) * 1000000000ULL + t.tv_nsec;
+}
+
+bool env_flag(const char* name) {
+  const char* e = std::getenv(name);
+  return e != nullptr && *e != '\0' && e[0] != '0';
+}
+bool uprobe_on() {
+  static const bool v = env_flag("DC_HWTS_UPROBE");
+  return v;
+}
+bool posthook_on() {
+  static const bool v = env_flag("DC_HWTS_POSTHOOK");
+  return v;
+}
+bool doorbell_on() {
+  static const bool v = env_flag("DC_HWTS_DOORBELL");
+  return v;
+}
+
+// DC_HWTS_SAMPLE=N emits 1-in-N data-plane completions so .pfw stays cheap and viewable on a
+// firehose (millions/s); markers (opcode 250/251) are join keys and are never sampled out. 1 =
+// every event.
+int sample_n() {
+  static const int v = [] {
+    const char* e = std::getenv("DC_HWTS_SAMPLE");
+    const int n = (e != nullptr && *e != '\0') ? std::atoi(e) : 1;
+    return n < 1 ? 1 : n;
+  }();
+  return v;
+}
+thread_local unsigned long long g_sample_ctr = 0;
 
 // Per-process .pfw sink: global-epoch COMPLETE records written as multi-member gzip.
 struct Sink {
@@ -96,24 +140,40 @@ void sink_init() {
 
 const char* opcode_name(uint32_t op) {
   switch (op) {
-    case IBV_WC_SEND: return "rdma_send";
-    case IBV_WC_RECV: return "rdma_recv";
-    case IBV_WC_RECV_RDMA_WITH_IMM: return "rdma_recv_imm";
-    case IBV_WC_RDMA_WRITE: return "rdma_write";
-    case IBV_WC_RDMA_READ: return "rdma_read";
-    case 250: return "rdma_post";  // our WITH_IMM send marker
-    case 260: return "doca_send";  // DOCA CQE (mlx5 op 0)
-    case 261: return "doca_recv";  // DOCA CQE (mlx5 op 2/3)
-    default: return "rdma_completion";
+    case IBV_WC_SEND:
+      return "rdma_send";
+    case IBV_WC_RECV:
+      return "rdma_recv";
+    case IBV_WC_RECV_RDMA_WITH_IMM:
+      return "rdma_recv_imm";
+    case IBV_WC_RDMA_WRITE:
+      return "rdma_write";
+    case IBV_WC_RDMA_READ:
+      return "rdma_read";
+    case 250:
+      return "rdma_post";  // send-post marker (cpu time)
+    case 251:
+      return "rdma_doorbell";  // ibv_wr_complete doorbell marker (cpu time)
+    case 260:
+      return "doca_send";  // DOCA CQE (mlx5 op 0)
+    case 261:
+      return "doca_recv";  // DOCA CQE (mlx5 op 2/3)
+    default:
+      return "rdma_completion";
   }
 }
 
 // Write one completion record. ref_ns = global-epoch ns (0 if unaligned); raw_ns = the original
-// device timestamp, kept in args so the mapping is auditable/reversible. phc is recorded for context.
+// device timestamp, kept in args so the mapping is auditable/reversible. phc is recorded for
+// context.
 void emit_record(uint64_t ref_ns, uint64_t raw_ns, uint64_t wr_id, uint32_t op, uint32_t imm,
                  uint32_t qp, int phc) {
   Sink* s = g_sink;
   if (s == nullptr) return;
+  if (op != 250 && op != 251) {  // markers are join keys, never sampled out
+    const int nth = sample_n();
+    if (nth > 1 && (g_sample_ctr++ % static_cast<unsigned>(nth)) != 0) return;
+  }
   char line[640];
   const int n = std::snprintf(
       line, sizeof(line),
@@ -129,11 +189,14 @@ void emit_record(uint64_t ref_ns, uint64_t raw_ns, uint64_t wr_id, uint32_t op, 
   if (s->buf.size() >= 256 * 1024) s->flush_locked();
 }
 
-// ibverbs completion: hw is a PHC-domain ns; remap through the per-PHC dc_timesync fit (0 = cpu marker).
+// ibverbs completion: hw is a PHC-domain ns; remap through the per-PHC dc_timesync fit. hw==0 is a
+// CPU-time marker (post/doorbell) -> stamp it now on CLOCK_MONOTONIC remapped to the global epoch,
+// not ts=0, so the marker lands at the post instant on the shared timeline.
 void emit(uint64_t hw_ns, uint64_t wr_id, uint32_t op, uint32_t imm, uint32_t qp, int phc) {
   Sink* s = g_sink;
   if (s == nullptr) return;
-  emit_record(hw_ns != 0 ? s->reader.remap_hw(hw_ns, phc) : 0, hw_ns, wr_id, op, imm, qp, phc);
+  const uint64_t ref = hw_ns != 0 ? s->reader.remap_hw(hw_ns, phc) : s->reader.remap(mono_ns());
+  emit_record(ref, hw_ns, wr_id, op, imm, qp, phc);
 }
 
 // The PHC that hardware-stamps this ibverbs device's completions (the clock_id dc_timesync keys its
@@ -189,7 +252,8 @@ thread_local int g_in_bridge = 0;
 int (*g_orig_poll_cq)(struct ibv_cq*, int, struct ibv_wc*) = nullptr;
 int (*g_orig_post_send)(struct ibv_qp*, struct ibv_send_wr*, struct ibv_send_wr**) = nullptr;
 
-// Bridge for the app's inlined ibv_poll_cq: run the extended poll, read the hw ts, fill the legacy wc.
+// Bridge for the app's inlined ibv_poll_cq: run the extended poll, read the hw ts, fill the legacy
+// wc.
 int poll_cq_bridge(struct ibv_cq* cq, int ne, struct ibv_wc* wc) {
   CqInfo ci;
   {
@@ -218,6 +282,9 @@ int poll_cq_bridge(struct ibv_cq* cq, int ne, struct ibv_wc* wc) {
         ci.wallclock ? ibv_wc_read_completion_wallclock_ns(cqx) : ibv_wc_read_completion_ts(cqx);
     const uint32_t imm = (wc[i].wc_flags & IBV_WC_WITH_IMM) ? wc[i].imm_data : 0;
     emit(hw, cqx->wr_id, static_cast<uint32_t>(wc[i].opcode), imm, wc[i].qp_num, ci.phc);
+    if (uprobe_on())  // opt-in hot path: a kernel trap per completion, unsafe on bulk data planes
+      datacrumbs_rdma_completion(hw, cqx->wr_id, static_cast<uint32_t>(wc[i].opcode), imm,
+                                 wc[i].qp_num);
     ++i;
     // Break BEFORE ibv_next_poll: it consumes the next completion, so breaking after would drop it.
     if (i >= ne) break;
@@ -237,9 +304,94 @@ int post_send_hook(struct ibv_qp* qp, struct ibv_send_wr* wr, struct ibv_send_wr
   return g_orig_post_send != nullptr ? g_orig_post_send(qp, wr, bad) : -1;
 }
 
+// Modern ibv_wr API markers (parallel to post_send_hook, which covers the legacy ibv_post_send).
+// wr_id is set on the qp before ibv_wr_send, so it matches the completion's join key; emitted after
+// the provider builds the WQE (the app's handoff instant).
+void (*g_orig_wr_send)(struct ibv_qp_ex*) = nullptr;
+void (*g_orig_wr_send_imm)(struct ibv_qp_ex*, __be32) = nullptr;
+int (*g_orig_wr_complete)(struct ibv_qp_ex*) = nullptr;
+void (*g_orig_wr_start)(struct ibv_qp_ex*) = nullptr;
+struct ibv_qp* (*g_orig_create_qp_ex)(struct ibv_context*, struct ibv_qp_init_attr_ex*) = nullptr;
+
+int wr_complete_hook(struct ibv_qp_ex* qpx);
+
+// mlx5 refills wr_complete during ibv_modify_qp (QP->RTS), clobbering the wrapper we set at qp
+// creation, so wr_send fires but wr_complete would not. wr_start runs every transaction after that
+// refill, so re-wrap here. All same-config mlx5 QPs share one handler pointer, so the global orig
+// is safe. Idempotent: skip if already ours.
+void wr_start_hook(struct ibv_qp_ex* qpx) {
+  g_orig_wr_start(qpx);
+  if (qpx->wr_complete != nullptr && qpx->wr_complete != wr_complete_hook) {
+    g_orig_wr_complete = qpx->wr_complete;
+    qpx->wr_complete = wr_complete_hook;
+  }
+}
+
+void wr_send_hook(struct ibv_qp_ex* qpx) {
+  g_orig_wr_send(qpx);
+  emit(0, qpx->wr_id, 250, 0, qpx->qp_base.qp_num, -1);
+}
+void wr_send_imm_hook(struct ibv_qp_ex* qpx, __be32 imm) {
+  g_orig_wr_send_imm(qpx, imm);
+  emit(0, qpx->wr_id, 250, ntohl(imm), qpx->qp_base.qp_num, -1);
+}
+// Doorbell split (opcode 251): wr_complete rings the doorbell, so this marks the hardware-post
+// instant. Emitted BEFORE the ring so the marker precedes the wire. ibv_wr_complete returns void in
+// this ABI it returns the batch's status, which we pass through unchanged.
+int wr_complete_hook(struct ibv_qp_ex* qpx) {
+  emit(0, qpx->wr_id, 251, 0, qpx->qp_base.qp_num, -1);
+  return g_orig_wr_complete(qpx);
+}
+
+// Provider create_qp_ex, returned unmodified; we only wrap the qp_ex wr_* pointers. Unlike the
+// create_cq_ex hook the rewrite dropped, this substitutes nothing, so it cannot corrupt provider
+// state (that hook crashed later ibv_modify_qp calls).
+struct ibv_qp* create_qp_ex_hook(struct ibv_context* context, struct ibv_qp_init_attr_ex* attr) {
+  struct ibv_qp* qp = g_orig_create_qp_ex != nullptr ? g_orig_create_qp_ex(context, attr) : nullptr;
+  if (qp == nullptr || attr == nullptr ||
+      !(attr->comp_mask & IBV_QP_INIT_ATTR_SEND_OPS_FLAGS))  // only these carry wr_* pointers
+    return qp;
+  struct ibv_qp_ex* qpx = ibv_qp_to_qp_ex(qp);
+  if (qpx == nullptr) return qp;
+  if (posthook_on() && qpx->wr_send != nullptr &&
+      (g_orig_wr_send == nullptr || qpx->wr_send == g_orig_wr_send)) {
+    if (g_orig_wr_send == nullptr) g_orig_wr_send = qpx->wr_send;
+    qpx->wr_send = wr_send_hook;
+  }
+  if (posthook_on() && qpx->wr_send_imm != nullptr &&
+      (g_orig_wr_send_imm == nullptr || qpx->wr_send_imm == g_orig_wr_send_imm)) {
+    if (g_orig_wr_send_imm == nullptr) g_orig_wr_send_imm = qpx->wr_send_imm;
+    qpx->wr_send_imm = wr_send_imm_hook;
+  }
+  if (doorbell_on() && qpx->wr_complete != nullptr &&
+      (g_orig_wr_complete == nullptr || qpx->wr_complete == g_orig_wr_complete)) {
+    if (g_orig_wr_complete == nullptr) g_orig_wr_complete = qpx->wr_complete;
+    qpx->wr_complete = wr_complete_hook;
+  }
+  if (doorbell_on() && qpx->wr_start != nullptr &&
+      (g_orig_wr_start == nullptr || qpx->wr_start == g_orig_wr_start)) {
+    if (g_orig_wr_start == nullptr) g_orig_wr_start = qpx->wr_start;
+    qpx->wr_start = wr_start_hook;
+  }
+  return qp;
+}
+
+// Install the modern-API hooks on this context's ops table. verbs_get_ctx_op validates the
+// provider's verbs_context is large enough and the op is set before we touch it, so the write is
+// guarded. Called from ibv_create_cq (a context is in hand there and CQ-before-QP is the standard
+// order).
+void hook_modern_wr_api(struct ibv_context* context) {
+  if (!posthook_on() && !doorbell_on()) return;
+  struct verbs_context* vctx = verbs_get_ctx_op(context, create_qp_ex);
+  if (vctx == nullptr) return;
+  if (g_orig_create_qp_ex == nullptr) g_orig_create_qp_ex = vctx->create_qp_ex;
+  if (vctx->create_qp_ex == g_orig_create_qp_ex) vctx->create_qp_ex = create_qp_ex_hook;
+}
+
 }  // namespace
 
-// Legacy (versioned, exported) ibv_create_cq -> timestamped extended CQ + poll hijack. The safe path.
+// Legacy (versioned, exported) ibv_create_cq -> timestamped extended CQ + poll hijack. The safe
+// path.
 extern "C" __attribute__((visibility("default"))) struct ibv_cq* ibv_create_cq(
     struct ibv_context* context, int cqe, void* cq_context, struct ibv_comp_channel* channel,
     int comp_vector) {
@@ -266,7 +418,8 @@ extern "C" __attribute__((visibility("default"))) struct ibv_cq* ibv_create_cq(
     cqx = ibv_create_cq_ex(context, &attr);
     wallclock = 0;
   }
-  if (cqx == nullptr) {  // device refuses timestamps -> plain CQ, do NOT hijack poll (capture empty)
+  if (cqx ==
+      nullptr) {  // device refuses timestamps -> plain CQ, do NOT hijack poll (capture empty)
     fprintf(stderr, "[dc-hwts] WARNING: timestamped CQ upgrade failed; this CQ is not captured\n");
     return real != nullptr ? real(context, cqe, cq_context, channel, comp_vector) : nullptr;
   }
@@ -275,6 +428,7 @@ extern "C" __attribute__((visibility("default"))) struct ibv_cq* ibv_create_cq(
   context->ops.poll_cq = poll_cq_bridge;
   if (g_orig_post_send == nullptr) g_orig_post_send = context->ops.post_send;
   context->ops.post_send = post_send_hook;
+  hook_modern_wr_api(context);  // opt-in modern ibv_wr markers + doorbell (no-op unless enabled)
 
   struct ibv_cq* cq = ibv_cq_ex_to_cq(cqx);
   {
@@ -301,6 +455,35 @@ extern "C" __attribute__((visibility("default"))) int ibv_destroy_cq(struct ibv_
   return real != nullptr ? real(cq) : -1;
 }
 
+// Install the modern ibv_wr markers on every opened device, independent of how the app builds its
+// CQ: an app that builds its CQ via the inline ibv_create_cq_ex we cannot hook would be missed if
+// we keyed this off ibv_create_cq. Completion capture still needs the legacy ibv_create_cq upgrade;
+// these CPU-time send markers do not.
+extern "C" __attribute__((visibility("default"))) struct ibv_context* ibv_open_device(
+    struct ibv_device* device) {
+  static struct ibv_context* (*real)(struct ibv_device*) = nullptr;
+  if (real == nullptr) {
+    real = (struct ibv_context * (*)(struct ibv_device*))
+        dlvsym(RTLD_NEXT, "ibv_open_device", "IBVERBS_1.1");
+    if (real == nullptr)
+      real = (struct ibv_context * (*)(struct ibv_device*)) dlsym(RTLD_NEXT, "ibv_open_device");
+  }
+  struct ibv_context* ctx = real != nullptr ? real(device) : nullptr;
+  if (ctx != nullptr && hwts_on() && (posthook_on() || doorbell_on())) {
+    std::call_once(g_once, sink_init);
+    hook_modern_wr_api(ctx);
+  }
+  return ctx;
+}
+
+// Per-completion server-uprobe target (opt-in DC_HWTS_UPROBE): a noinline no-op the server uprobes
+// to land each completion in the kernel trace. Hot (a kernel trap per completion); the direct .pfw
+// write is the default. The asm keeps the args live so they are readable at the probe site.
+extern "C" __attribute__((noinline, visibility("default"))) void datacrumbs_rdma_completion(
+    uint64_t hw_ns, uint64_t wr_id, uint32_t opcode, uint32_t imm, uint32_t qp_num) {
+  __asm__ __volatile__("" ::"r"(hw_ns), "r"(wr_id), "r"(opcode), "r"(imm), "r"(qp_num) : "memory");
+}
+
 namespace {
 __attribute__((destructor)) void rdma_hwts_fini() {
   Sink* s = g_sink;
@@ -312,12 +495,13 @@ __attribute__((destructor)) void rdma_hwts_fini() {
 }  // namespace
 
 #ifdef DATACRUMBS_DOCA_HWTS
-// DOCA fabric CQE capture. The DPU<->DPU data fabric is DOCA-RDMA (mlx5 DevX, kernel-bypass) with its
-// own hidden CQ, invisible to the ibv_create_cq path above and to any DOCA API. But
-// priv_doca_cq_poll_one(cq, out_cqe) copies the raw mlx5 CQE into arg1 and returns 0 on a hit: the NIC
-// hw timestamp is at out_cqe+48 (__be64), opcode in the high nibble of byte 63, imm at +36. We
-// inline-hook it via frida-gum and feed each completion into the same emit() path (opcode 260/261 ->
-// doca_send/doca_recv). Opt-in: DC_HWTS=1 + DC_HWTS_DOCA=1. Built only in the DOCA-native target.
+// DOCA fabric CQE capture. The DPU<->DPU data fabric is DOCA-RDMA (mlx5 DevX, kernel-bypass) with
+// its own hidden CQ, invisible to the ibv_create_cq path above and to any DOCA API. But
+// priv_doca_cq_poll_one(cq, out_cqe) copies the raw mlx5 CQE into arg1 and returns 0 on a hit: the
+// NIC hw timestamp is at out_cqe+48 (__be64), opcode in the high nibble of byte 63, imm at +36. We
+// inline-hook it via frida-gum and feed each completion into the same emit() path (opcode 260/261
+// -> doca_send/doca_recv). Opt-in: DC_HWTS=1 + DC_HWTS_DOCA=1. Built only in the DOCA-native
+// target.
 namespace {
 
 // raw(HCA free-running ns) <-> CLOCK_MONOTONIC anchor for the DOCA device. The CQE ts is the HCA
@@ -327,23 +511,19 @@ namespace {
 struct DocaAnchor {
   struct ibv_context* ctx = nullptr;
   std::atomic<int64_t> raw_minus_mono{0};
-  std::atomic<int64_t> at_mono{0};  // MONOTONIC ns when raw_minus_mono was sampled (re-anchor timer)
+  std::atomic<int64_t> at_mono{
+      0};  // MONOTONIC ns when raw_minus_mono was sampled (re-anchor timer)
   std::atomic<bool> valid{false};
 };
 DocaAnchor g_anchor;
 
-int64_t mono_ns() {
-  struct timespec t;
-  clock_gettime(CLOCK_MONOTONIC, &t);
-  return static_cast<int64_t>(t.tv_sec) * 1000000000LL + t.tv_nsec;
-}
-
-// Resolve verbs symbols by DEFAULT version (dlsym RTLD_DEFAULT), never an unversioned link ref, which
-// mis-binds against the versioned symbol.
+// Resolve verbs symbols by DEFAULT version (dlsym RTLD_DEFAULT), never an unversioned link ref,
+// which mis-binds against the versioned symbol.
 void doca_open_anchor_ctx(const char* dev) {
-  auto get_list = (struct ibv_device** (*)(int*))dlsym(RTLD_DEFAULT, "ibv_get_device_list");
+  auto get_list = (struct ibv_device * *(*)(int*)) dlsym(RTLD_DEFAULT, "ibv_get_device_list");
   auto get_name = (const char* (*)(struct ibv_device*))dlsym(RTLD_DEFAULT, "ibv_get_device_name");
-  auto open_dev = (struct ibv_context* (*)(struct ibv_device*))dlsym(RTLD_DEFAULT, "ibv_open_device");
+  auto open_dev =
+      (struct ibv_context * (*)(struct ibv_device*)) dlsym(RTLD_DEFAULT, "ibv_open_device");
   if (get_list == nullptr || get_name == nullptr || open_dev == nullptr) return;
   int n = 0;
   struct ibv_device** list = get_list(&n);
@@ -365,9 +545,9 @@ void doca_sample_anchor() {
   // Bracket the raw read between two MONOTONIC reads and use the midpoint, so the anchor offset is
   // free of the read-latency skew (sub-us). ibv_query_rt_values_ex is a static inline (dispatches
   // through the ctx), so there is no exported symbol to dlsym; the ctx came from the real ibv_open.
-  const int64_t m1 = mono_ns();
+  const int64_t m1 = static_cast<int64_t>(mono_ns());
   if (ibv_query_rt_values_ex(g_anchor.ctx, &v) != 0) return;
-  const int64_t m2 = mono_ns();
+  const int64_t m2 = static_cast<int64_t>(mono_ns());
   const int64_t raw = static_cast<int64_t>(v.raw_clock.tv_sec) * 1000000000LL + v.raw_clock.tv_nsec;
   g_anchor.raw_minus_mono.store(raw - (m1 + m2) / 2, std::memory_order_relaxed);
   g_anchor.at_mono.store(m2, std::memory_order_relaxed);
@@ -408,7 +588,8 @@ void dc_doca_on_leave(GumInvocationListener*, GumInvocationContext* ic) {
     if (ref == 0 && g_anchor.valid.load(std::memory_order_relaxed)) {
       // Time-based re-anchor (not count-based: low-rate DOCA would never re-fire): >50ms bounds the
       // ~1ppm HCA<->CPU drift to <=50ns, so the fallback mapping stays sub-us.
-      if (mono_ns() - g_anchor.at_mono.load(std::memory_order_relaxed) > 50000000LL)
+      if (static_cast<int64_t>(mono_ns()) - g_anchor.at_mono.load(std::memory_order_relaxed) >
+          50000000LL)
         doca_sample_anchor();
       const int64_t mono =
           static_cast<int64_t>(hw) - g_anchor.raw_minus_mono.load(std::memory_order_relaxed);

@@ -399,9 +399,10 @@ ConfigurationManager::ConfigurationManager(int argc, char** argv, bool load_capt
             }
             probe->system_wide =
                 probe_node["system_wide"] ? probe_node["system_wide"].as<bool>() : false;
-            probe->aggregate =
-                probe_node["aggregate"] ? probe_node["aggregate"].as<bool>() : false;
+            probe->aggregate = probe_node["aggregate"] ? probe_node["aggregate"].as<bool>() : false;
             probe->hot = probe_node["hot"] ? probe_node["hot"].as<bool>() : false;
+            probe->hot_exclude =
+                probe_node["hot_exclude"] ? probe_node["hot_exclude"].as<std::string>() : "";
             this->capture_probes.push_back(probe);
           }
         }

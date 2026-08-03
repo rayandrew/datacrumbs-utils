@@ -407,8 +407,8 @@ extract_dwarf_function_signatures(const std::string& elf_path,
     }
 
     if (current_function.level >= 0) {
-      // Only the first DW_AT_name (the subprogram's own, before any child DIE) is the function name;
-      // nested DW_TAG_variable/formal_parameter names must not overwrite it.
+      // Only the first DW_AT_name (the subprogram's own, before any child DIE) is the function
+      // name; nested DW_TAG_variable/formal_parameter names must not overwrite it.
       if (line.find("DW_AT_name") != std::string::npos && current_function.name.empty()) {
         current_function.name = extract_quoted_value(line);
         current_function_needed = !filter_to_target_names ||
@@ -1379,10 +1379,44 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::extractProbes() {
       functionNames = std::move(filteredNames);
     }
 
+    // hot_exclude: split a bpftime hot layer. Functions matching the regex are frida-unsafe (inline
+    // hooking them corrupts the workload, e.g. a DOCA/RDMA send), so capture them via a kernel
+    // uprobe twin ("<name>_k") while the rest stay on the hot path.
+    if (capture_probe->hot && !capture_probe->hot_exclude.empty() &&
+        capture_probe->type == CaptureType::BINARY) {
+      const std::regex ex(capture_probe->hot_exclude, std::regex_constants::icase);
+      std::vector<std::string> kept, demoted;
+      for (auto& name : functionNames)
+        (std::regex_search(name, ex) ? demoted : kept).push_back(name);
+      functionNames = std::move(kept);
+      auto bp = std::static_pointer_cast<BinaryCaptureProbe>(capture_probe);
+      std::vector<std::string> twin_fns;
+      for (auto& name : demoted)
+        if (global_function_names.insert(bp->file + "_" + name).second) twin_fns.push_back(name);
+      if (!twin_fns.empty()) {
+        std::sort(twin_fns.begin(), twin_fns.end());
+        auto twin = std::make_shared<UProbe>();
+        twin->name = capture_probe->name + "_k";
+        twin->trace_event_type = capture_probe->trace_event_type;
+        twin->binary_path = bp->file;
+        twin->include_offsets = bp->include_offsets;
+        twin->functions = twin_fns;
+        attach_discovered_function_signatures(twin.get(), ProbeType::UPROBE, twin_fns,
+                                              discovered_function_signatures);
+        if (twin->validate()) {
+          probes.push_back(twin);
+          ++extracted_probe_count;
+          DC_LOG_INFO("[ProbeExplorer] hot_exclude split '%s': %zu hot, %zu -> kernel uprobe '%s'",
+                      capture_probe->name.c_str(), functionNames.size(), twin_fns.size(),
+                      twin->name.c_str());
+        }
+      }
+    }
+
     probe->name = capture_probe->name;
     probe->trace_event_type = capture_probe->trace_event_type;  // .pfw domain
     probe->system_wide = capture_probe->system_wide;            // tracepoint pid-gate opt-out
-    probe->aggregate = capture_probe->aggregate;               // count/duration instead of events
+    probe->aggregate = capture_probe->aggregate;                // count/duration instead of events
     probe->hot = capture_probe->hot;                            // uprobe -> bpftime userspace path
 
     // For syscall probes, normalize to base syscall names expected by attach_ksyscall.

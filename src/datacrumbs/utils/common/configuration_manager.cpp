@@ -403,6 +403,9 @@ ConfigurationManager::ConfigurationManager(int argc, char** argv, bool load_capt
             probe->hot = probe_node["hot"] ? probe_node["hot"].as<bool>() : false;
             probe->hot_exclude =
                 probe_node["hot_exclude"] ? probe_node["hot_exclude"].as<std::string>() : "";
+            if (probe_node["hot_sensitive"])
+              for (const auto& s : probe_node["hot_sensitive"])
+                probe->hot_sensitive.push_back(s.as<std::string>());
             this->capture_probes.push_back(probe);
           }
         }

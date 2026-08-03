@@ -20,6 +20,7 @@
 #include <sstream>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 // Singleton statics for TracepointCapture (mirrors ksym_capture.cpp for KSymCapture); the mechanism
 // is header-only, so its sole consumer defines them here.
@@ -933,6 +934,37 @@ ProbeExplorer::Extract_Exclusions() {
 
   DC_LOG_TRACE("ProbeExplorer::validate_exclusion_file - end");
 }
+// Function symbols in `binary` that directly call a symbol matching any `sensitive` regex, found by
+// scanning objdump disassembly for `bl` targets. Auto-demotes frida-unsafe hot functions (those
+// reaching a DOCA/RDMA call) off a hot layer without hand-listing them.
+static std::unordered_set<std::string> functions_calling_sensitive(
+    const std::string& binary, const std::vector<std::string>& sensitive) {
+  std::unordered_set<std::string> result;
+  if (sensitive.empty()) return result;
+  std::vector<std::regex> pats;
+  for (const auto& s : sensitive) pats.emplace_back(s);
+  const std::string out = run_command("objdump -d " + shell_escape(binary) + " 2>/dev/null");
+  std::istringstream stream(out);
+  std::string line, current;
+  const std::regex func_re(R"(^[0-9a-f]+ <([^>]+)>:)");
+  const std::regex call_re(R"(\bbl\s+[0-9a-f]+ <([^>@]+))");
+  std::smatch m;
+  while (std::getline(stream, line)) {
+    if (std::regex_search(line, m, func_re)) {
+      current = m[1].str();
+      continue;
+    }
+    if (current.empty() || !std::regex_search(line, m, call_re)) continue;
+    const std::string target = m[1].str();
+    for (const auto& p : pats)
+      if (std::regex_search(target, p)) {
+        result.insert(current);
+        break;
+      }
+  }
+  return result;
+}
+
 // Extracts probes based on configuration and exclusion file
 std::vector<std::shared_ptr<Probe>> ProbeExplorer::extractProbes() {
   DC_LOG_TRACE("ProbeExplorer::extractProbes - start");
@@ -1379,20 +1411,41 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::extractProbes() {
       functionNames = std::move(filteredNames);
     }
 
-    // hot_exclude: split a bpftime hot layer. Functions matching the regex are frida-unsafe (inline
-    // hooking them corrupts the workload, e.g. a DOCA/RDMA send), so capture them via a kernel
-    // uprobe twin ("<name>_k") while the rest stay on the hot path.
-    if (capture_probe->hot && !capture_probe->hot_exclude.empty() &&
-        capture_probe->type == CaptureType::BINARY) {
-      const std::regex ex(capture_probe->hot_exclude, std::regex_constants::icase);
-      std::vector<std::string> kept, demoted;
-      for (auto& name : functionNames)
-        (std::regex_search(name, ex) ? demoted : kept).push_back(name);
-      functionNames = std::move(kept);
+    // Split a bpftime hot layer: functions that are frida-unsafe (inline hooking them corrupts the
+    // workload, e.g. a DOCA/RDMA send) go to a kernel uprobe twin ("<name>_k"), the rest stay hot.
+    // Unsafe = matches hot_exclude by name, OR (hot_sensitive) calls a symbol reaching DOCA/RDMA.
+    if (capture_probe->hot && capture_probe->type == CaptureType::BINARY &&
+        (!capture_probe->hot_exclude.empty() || !capture_probe->hot_sensitive.empty())) {
       auto bp = std::static_pointer_cast<BinaryCaptureProbe>(capture_probe);
-      std::vector<std::string> twin_fns;
-      for (auto& name : demoted)
-        if (global_function_names.insert(bp->file + "_" + name).second) twin_fns.push_back(name);
+      const bool has_ex = !capture_probe->hot_exclude.empty();
+      const std::regex ex(has_ex ? capture_probe->hot_exclude : "$^", std::regex_constants::icase);
+      const auto sensitive_callers =
+          functions_calling_sensitive(bp->file, capture_probe->hot_sensitive);
+      // Decide demotion per OFFSET, not per name: C1/C2 ctors and D1/D2 dtors fold to one address,
+      // so an alias staying hot (frida) while its twin goes kernel puts a frida hook and a uprobe
+      // BRK on the same offset - frida relocates the BRK into a trampoline and it SIGTRAPs. If any
+      // alias at an offset is unsafe, the whole offset is demoted. names carry a ":0xADDR" suffix;
+      // sensitive_callers are bare symbols.
+      auto offset_key = [](const std::string& n) {
+        const auto p = n.find(':');
+        return p == std::string::npos ? n : n.substr(p);
+      };
+      std::unordered_set<std::string> demoted_offsets;
+      for (auto& name : functionNames)
+        if ((has_ex && std::regex_search(name, ex)) ||
+            sensitive_callers.count(name.substr(0, name.find(':'))))
+          demoted_offsets.insert(offset_key(name));
+      std::vector<std::string> kept, twin_fns;
+      std::unordered_set<std::string> twin_offsets;
+      for (auto& name : functionNames) {
+        if (!demoted_offsets.count(offset_key(name))) {
+          kept.push_back(name);
+        } else if (twin_offsets.insert(offset_key(name)).second &&
+                   global_function_names.insert(bp->file + "_" + name).second) {
+          twin_fns.push_back(name);
+        }
+      }
+      functionNames = std::move(kept);
       if (!twin_fns.empty()) {
         std::sort(twin_fns.begin(), twin_fns.end());
         auto twin = std::make_shared<UProbe>();
@@ -1406,7 +1459,7 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::extractProbes() {
         if (twin->validate()) {
           probes.push_back(twin);
           ++extracted_probe_count;
-          DC_LOG_INFO("[ProbeExplorer] hot_exclude split '%s': %zu hot, %zu -> kernel uprobe '%s'",
+          DC_LOG_INFO("[ProbeExplorer] hot split '%s': %zu hot, %zu -> kernel uprobe '%s'",
                       capture_probe->name.c_str(), functionNames.size(), twin_fns.size(),
                       twin->name.c_str());
         }

@@ -401,6 +401,8 @@ ConfigurationManager::ConfigurationManager(int argc, char** argv, bool load_capt
                 probe_node["system_wide"] ? probe_node["system_wide"].as<bool>() : false;
             probe->aggregate = probe_node["aggregate"] ? probe_node["aggregate"].as<bool>() : false;
             probe->hot = probe_node["hot"] ? probe_node["hot"].as<bool>() : false;
+            probe->capture_stack =
+                probe_node["capture_stack"] ? probe_node["capture_stack"].as<bool>() : false;
             probe->hot_exclude =
                 probe_node["hot_exclude"] ? probe_node["hot_exclude"].as<std::string>() : "";
             if (probe_node["hot_sensitive"])

@@ -57,6 +57,8 @@ const char* probe_type_to_string(datacrumbs::ProbeType type) {
       return "custom";
     case datacrumbs::ProbeType::TRACEPOINT:
       return "tracepoint";
+    case datacrumbs::ProbeType::PERF_EVENT:
+      return "perf_event";
   }
   return "unknown";
 }
@@ -75,8 +77,22 @@ const char* capture_type_to_string(datacrumbs::CaptureType type) {
       return "custom";
     case datacrumbs::CaptureType::TRACEPOINT:
       return "tracepoint";
+    case datacrumbs::CaptureType::PERF_EVENT:
+      return "perf_event";
   }
   return "unknown";
+}
+
+// The sampler's "functions" are perf event names, not symbols, so there is nothing to enumerate:
+// match the regex against the set the server can translate to a perf_event_attr.
+std::vector<std::string> perf_events_by_regex(const std::string& pattern) {
+  static const char* kSupported[] = {"cpu-clock", "task-clock", "cycles", "instructions"};
+  std::vector<std::string> result;
+  std::regex re(pattern);
+  for (const char* event : kSupported) {
+    if (std::regex_search(event, re)) result.push_back(event);
+  }
+  return result;
 }
 
 json_object* string_or_empty_json(const char* value) {
@@ -1211,6 +1227,10 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::extractProbes() {
               datacrumbs::Singleton<TracepointCapture>::get_instance()->getFunctionsByRegex(
                   capture_probe->regex);  // "category:name"; no BTF signatures for tracepoints
           break;
+        case CaptureType::PERF_EVENT:
+          DC_LOG_INFO("Extracting perf sampling events...");
+          result.function_names = perf_events_by_regex(capture_probe->regex);
+          break;
         case CaptureType::CUSTOM:
           DC_LOG_INFO("Extracting custom probes...");
           if (auto customProbe = std::static_pointer_cast<CustomCaptureProbe>(capture_probe)) {
@@ -1298,6 +1318,9 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::extractProbes() {
         break;
       case ProbeType::TRACEPOINT:
         probe = std::make_shared<TracepointProbe>();
+        break;
+      case ProbeType::PERF_EVENT:
+        probe = std::make_shared<PerfEventProbe>();
         break;
       default:
         DC_LOG_ERROR("Unknown probe type encountered in extractProbes()");
@@ -1472,6 +1495,8 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::extractProbes() {
     probe->aggregate = capture_probe->aggregate;                // count/duration instead of events
     probe->hot = capture_probe->hot;                            // uprobe -> bpftime userspace path
     probe->capture_stack = capture_probe->capture_stack;        // grab user stack at tracepoints
+    probe->sample_freq = capture_probe->sample_freq;            // perf_event sampling rate
+    probe->stack_dump_ratio = capture_probe->stack_dump_ratio;  // 1-in-N raw stack dumps
 
     // For syscall probes, normalize to base syscall names expected by attach_ksyscall.
     if (capture_probe->probe_type == ProbeType::SYSCALLS) {
@@ -1579,7 +1604,8 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::extractProbes() {
         }
         break;
       }
-      case CaptureType::TRACEPOINT:  // same kernel-name dedup as KSYM (KernelCaptureProbe)
+      case CaptureType::PERF_EVENT:  // same kernel-name dedup as KSYM (KernelCaptureProbe)
+      case CaptureType::TRACEPOINT:
       case CaptureType::KSYM: {
         DC_LOG_INFO("Deduplicating kernel symbol probes...");
         if (auto ksymProbe = std::static_pointer_cast<KernelCaptureProbe>(capture_probe)) {
@@ -1745,6 +1771,9 @@ void ProbeExplorer::create_exclusion_file(std::vector<std::shared_ptr<Probe>> pr
       case ProbeType::TRACEPOINT:
         jexclude = std::dynamic_pointer_cast<TracepointProbe>(probe)->toJson(false);
         break;
+      case ProbeType::PERF_EVENT:
+        jexclude = std::dynamic_pointer_cast<PerfEventProbe>(probe)->toJson(false);
+        break;
       default:
         DC_LOG_ERROR("Unknown probe type encountered.");
         continue;  // Skip unknown types
@@ -1830,6 +1859,10 @@ std::unordered_map<std::string, std::shared_ptr<Probe>> ProbeExplorer::loadExist
               case ProbeType::TRACEPOINT:
                 probe = std::make_shared<TracepointProbe>();
                 probe->type = ProbeType::TRACEPOINT;
+                break;
+              case ProbeType::PERF_EVENT:
+                probe = std::make_shared<PerfEventProbe>();
+                probe->type = ProbeType::PERF_EVENT;
                 break;
               default:
                 DC_LOG_WARN("Unknown probe type '%d' for probe '%s'", static_cast<int>(probe_type),
@@ -1978,6 +2011,9 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::writeProbesToJson() {
         break;
       case ProbeType::TRACEPOINT:
         jprobe = std::dynamic_pointer_cast<TracepointProbe>(probe)->toJson();
+        break;
+      case ProbeType::PERF_EVENT:
+        jprobe = std::dynamic_pointer_cast<PerfEventProbe>(probe)->toJson();
         break;
       default:
         DC_LOG_ERROR("Unknown probe type encountered.");

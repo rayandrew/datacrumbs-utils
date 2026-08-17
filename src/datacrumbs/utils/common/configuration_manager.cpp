@@ -361,6 +361,15 @@ ConfigurationManager::ConfigurationManager(int argc, char** argv, bool load_capt
                 probe = tp_probe;
                 break;
               }
+              case CaptureType::PERF_EVENT: {
+                auto pe_probe = std::make_shared<KernelCaptureProbe>(CaptureType::PERF_EVENT);
+                if (!probe_node["regex"]) {
+                  throw std::invalid_argument("Regex is required for PERF_EVENT capture type.");
+                }
+                pe_probe->regex = probe_node["regex"].as<std::string>();
+                probe = pe_probe;
+                break;
+              }
               case CaptureType::CUSTOM: {
                 auto custom_probe = std::make_shared<CustomCaptureProbe>();
                 if (!probe_node["file"] || !probe_node["probes"]) {
@@ -403,6 +412,11 @@ ConfigurationManager::ConfigurationManager(int argc, char** argv, bool load_capt
             probe->hot = probe_node["hot"] ? probe_node["hot"].as<bool>() : false;
             probe->capture_stack =
                 probe_node["capture_stack"] ? probe_node["capture_stack"].as<bool>() : false;
+            probe->sample_freq =
+                probe_node["sample_freq"] ? probe_node["sample_freq"].as<unsigned int>() : 0;
+            probe->stack_dump_ratio = probe_node["stack_dump_ratio"]
+                                          ? probe_node["stack_dump_ratio"].as<unsigned int>()
+                                          : 0;
             probe->hot_exclude =
                 probe_node["hot_exclude"] ? probe_node["hot_exclude"].as<std::string>() : "";
             if (probe_node["hot_sensitive"])

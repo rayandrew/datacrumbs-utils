@@ -108,6 +108,18 @@ std::filesystem::path absolute_normalized_path(const std::filesystem::path& inpu
   return absolute_path.lexically_normal();
 }
 
+// A probe's symbol filter, from either `regex` or the friendlier `glob`. Everything downstream
+// consumes one regex field, so a glob is translated here rather than carried as a second mode.
+std::string pattern_of(const YAML::Node& probe_node) {
+  if (probe_node["glob"]) {
+    return datacrumbs::utils::glob_to_regex(probe_node["glob"].as<std::string>());
+  }
+  if (probe_node["regex"]) {
+    return probe_node["regex"].as<std::string>();
+  }
+  return "";
+}
+
 }  // namespace
 
 // Singleton template specialization for ConfigurationManager
@@ -332,10 +344,9 @@ ConfigurationManager::ConfigurationManager(int argc, char** argv, bool load_capt
               }
               case CaptureType::KSYM: {
                 auto kernel_probe = std::make_shared<KernelCaptureProbe>();
-                if (probe_node["regex"]) {
-                  kernel_probe->regex = probe_node["regex"].as<std::string>();
-                } else {
-                  throw std::invalid_argument("Regex is required for KSYM capture type.");
+                kernel_probe->regex = pattern_of(probe_node);
+                if (kernel_probe->regex.empty()) {
+                  throw std::invalid_argument("regex or glob is required for KSYM capture type.");
                 }
                 probe = kernel_probe;
                 break;
@@ -354,19 +365,21 @@ ConfigurationManager::ConfigurationManager(int argc, char** argv, bool load_capt
               }
               case CaptureType::TRACEPOINT: {
                 auto tp_probe = std::make_shared<KernelCaptureProbe>(CaptureType::TRACEPOINT);
-                if (!probe_node["regex"]) {
-                  throw std::invalid_argument("Regex is required for TRACEPOINT capture type.");
+                tp_probe->regex = pattern_of(probe_node);
+                if (tp_probe->regex.empty()) {
+                  throw std::invalid_argument(
+                      "regex or glob is required for TRACEPOINT capture type.");
                 }
-                tp_probe->regex = probe_node["regex"].as<std::string>();
                 probe = tp_probe;
                 break;
               }
               case CaptureType::PERF_EVENT: {
                 auto pe_probe = std::make_shared<KernelCaptureProbe>(CaptureType::PERF_EVENT);
-                if (!probe_node["regex"]) {
-                  throw std::invalid_argument("Regex is required for PERF_EVENT capture type.");
+                pe_probe->regex = pattern_of(probe_node);
+                if (pe_probe->regex.empty()) {
+                  throw std::invalid_argument(
+                      "regex or glob is required for PERF_EVENT capture type.");
                 }
-                pe_probe->regex = probe_node["regex"].as<std::string>();
                 probe = pe_probe;
                 break;
               }
@@ -400,8 +413,8 @@ ConfigurationManager::ConfigurationManager(int argc, char** argv, bool load_capt
             }
             convert(probe_node["probe"].as<std::string>(), probe->probe_type);
             probe->name = probe_node["name"].as<std::string>();
-            if (probe_node["regex"]) {
-              probe->regex = probe_node["regex"].as<std::string>();
+            if (const std::string pattern = pattern_of(probe_node); !pattern.empty()) {
+              probe->regex = pattern;
             }
             if (probe_node["trace_event_type"]) {
               probe->trace_event_type = probe_node["trace_event_type"].as<std::string>();
@@ -418,7 +431,10 @@ ConfigurationManager::ConfigurationManager(int argc, char** argv, bool load_capt
                                           ? probe_node["stack_dump_ratio"].as<unsigned int>()
                                           : 0;
             probe->hot_exclude =
-                probe_node["hot_exclude"] ? probe_node["hot_exclude"].as<std::string>() : "";
+                probe_node["hot_exclude_glob"]
+                    ? datacrumbs::utils::glob_to_regex(
+                          probe_node["hot_exclude_glob"].as<std::string>())
+                    : (probe_node["hot_exclude"] ? probe_node["hot_exclude"].as<std::string>() : "");
             if (probe_node["hot_sensitive"])
               for (const auto& s : probe_node["hot_sensitive"])
                 probe->hot_sensitive.push_back(s.as<std::string>());

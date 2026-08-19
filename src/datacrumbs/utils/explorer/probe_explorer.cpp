@@ -251,7 +251,7 @@ bool should_use_default_mpi_api_filter(const datacrumbs::CaptureProbe& capture_p
                                        const std::string& binary_path) {
   if (!is_openmpi_library(binary_path)) return false;
   const std::string regex = trim_copy(capture_probe.regex);
-  return regex.empty() || regex == ".*";
+  return regex.empty() || regex == ".*" || regex == "^.*$";  // "^.*$" is glob "*" translated
 }
 
 bool is_supported_runtime_probe_type(datacrumbs::ProbeType type) {
@@ -1422,14 +1422,21 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::extractProbes() {
     auto functionNames = std::move(result.function_names);
     auto discovered_function_signatures = std::move(result.discovered_function_signatures);
 
-    // Filter function names by regex if specified
+    // Symbols carry a ":0xADDR" suffix and regex_match needs the whole string, so a natural
+    // "^name$" matches nothing. Match the bare symbol too.
     if (!capture_probe->regex.empty()) {
       std::regex re(capture_probe->regex, std::regex_constants::icase);
       std::vector<std::string> filteredNames;
       for (const auto& name : functionNames) {
-        if (std::regex_match(name, re)) {
+        const std::string bare = name.substr(0, name.find(':'));
+        if (std::regex_match(name, re) || std::regex_match(bare, re)) {
           filteredNames.push_back(name);
         }
+      }
+      if (filteredNames.empty() && !functionNames.empty()) {
+        DC_LOG_WARN("[ProbeExplorer] '%s': regex '%s' matched none of %zu symbols (e.g. '%s')",
+                    capture_probe->name.c_str(), capture_probe->regex.c_str(), functionNames.size(),
+                    functionNames.front().c_str());
       }
       functionNames = std::move(filteredNames);
     }

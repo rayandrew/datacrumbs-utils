@@ -632,7 +632,17 @@ int main(int argc, char** argv) {
         }
       }
       warm = 0;  // discard only the very first (cold-start) exchange
-      usleep((useconds_t)cadence_ms * 1000);
+      // Serve peers while idle instead of sleeping blind. With only the reference answering, the
+      // topology is a star: it has no cycles, so loop-closure checks are impossible, and those are
+      // the only way to bound path asymmetry (a two-way exchange cannot separate it from offset).
+      // respond_once ignores anything that is not a T_REQ, so our own replies pass through safely.
+      uint64_t idle_until = mono_ns() + (uint64_t)cadence_ms * 1000000ull;
+      for (;;) {
+        int64_t left_ms = ((int64_t)idle_until - (int64_t)mono_ns()) / 1000000;
+        if (left_ms <= 0) break;
+        struct pollfd pfd = {.fd = fd, .events = POLLIN};
+        if (poll(&pfd, 1, (int)left_ms) > 0) respond_once(fd);
+      }
     }
   }
 

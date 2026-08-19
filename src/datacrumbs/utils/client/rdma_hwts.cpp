@@ -25,6 +25,7 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -127,7 +128,14 @@ void sink_init() {
   if (dir == nullptr || *dir == '\0') dir = "/tmp";
   char path[1024];
   std::snprintf(path, sizeof(path), "%s/trace-rdma-%d-%s.pfw.gz", dir, getpid(), host);
+  mkdir(dir, 0755);  // callers pass a per-run dir; without this fopen just fails
   s->file = std::fopen(path, "wb");
+  if (s->file == nullptr) {
+    // capture is opt-in, so a sink we cannot write is a silent total loss of the very data that
+    // was asked for: every record would be dropped and the run would look merely empty.
+    fprintf(stderr, "[dc-hwts] FATAL: cannot open %s: %s\n", path, strerror(errno));
+    _exit(1);
+  }
   char hh[512];
   const int n = std::snprintf(
       hh, sizeof(hh),

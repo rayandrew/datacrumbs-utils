@@ -618,15 +618,31 @@ __attribute__((constructor)) void dc_doca_install() {
     doca_sample_anchor();
   }
   gum_init_embedded();
-  gpointer target = reinterpret_cast<gpointer>(
-      gum_module_find_export_by_name("libdoca_common.so", "priv_doca_cq_poll_one"));
-  if (target == nullptr) {  // internal symbol may not export -> known offset for this build
-    GumAddress base = gum_module_find_base_address("libdoca_common.so");
-    if (base != 0) target = GSIZE_TO_POINTER(base + 0x57934);
+  // Resolve through the loader, not by module name: the proxy loads the soname
+  // (libdoca_common.so.3.0.0058), so an exact "libdoca_common.so" lookup finds nothing and the hook
+  // silently never attaches, leaving a run with no wire timestamps at all. A previous build-specific
+  // offset fallback is deliberately gone: on any other DOCA build it would point mid-function and
+  // emit confident garbage, which is worse than emitting nothing.
+  // Resolve through an explicit handle. The DSO is not in the global symbol scope, so
+  // dlsym(RTLD_DEFAULT) misses it however the symbol is declared, and the loader knows it by a
+  // versioned soname rather than "libdoca_common.so", which is why a module-name lookup also
+  // failed. dlopen on an already-mapped file only takes another reference to the same mapping, so
+  // the address returned is the live one.
+  gpointer target = nullptr;
+  for (const char* name : {"libdoca_common.so.3", "libdoca_common.so.2", "libdoca_common.so"}) {
+    void* h = dlopen(name, RTLD_NOW | RTLD_NOLOAD);
+    if (h == nullptr) h = dlopen(name, RTLD_NOW);
+    if (h == nullptr) continue;
+    target = dlsym(h, "priv_doca_cq_poll_one");
+    if (target != nullptr) break;
   }
   if (target == nullptr) {
-    fprintf(stderr, "[dc-hwts] DC_HWTS_DOCA: priv_doca_cq_poll_one not found\n");
-    return;
+    // DC_HWTS_DOCA is explicit opt-in, so a miss means the requested capture cannot happen. Die
+    // rather than let the run complete and be analysed as if the wire were simply invisible.
+    fprintf(stderr,
+            "[dc-hwts] FATAL: DC_HWTS_DOCA=1 but priv_doca_cq_poll_one is unavailable "
+            "(DOCA build changed?); refusing to run without the wire timestamps\n");
+    _exit(1);
   }
   GumInterceptor* it = gum_interceptor_obtain();
   GObject* lis = static_cast<GObject*>(g_object_new(dc_doca_listener_get_type(), nullptr));

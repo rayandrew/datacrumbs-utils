@@ -174,8 +174,11 @@ const char* opcode_name(uint32_t op) {
 // Write one completion record. ref_ns = global-epoch ns (0 if unaligned); raw_ns = the original
 // device timestamp, kept in args so the mapping is auditable/reversible. phc is recorded for
 // context.
+// `wqe` is the CQE's per-queue sequence number (mlx5 wqe_counter), 0 when unknown. It is the only
+// per-message identity a CQE carries: wr_id lives in the WQE, not the completion, so the DOCA path
+// has none. Kept separate from wr_id so the two are never confused by a consumer.
 void emit_record(uint64_t ref_ns, uint64_t raw_ns, uint64_t wr_id, uint32_t op, uint32_t imm,
-                 uint32_t qp, int phc) {
+                 uint32_t qp, int phc, uint32_t wqe = 0) {
   Sink* s = g_sink;
   if (s == nullptr) return;
   if (op != 250 && op != 251) {  // markers are join keys, never sampled out
@@ -185,12 +188,12 @@ void emit_record(uint64_t ref_ns, uint64_t raw_ns, uint64_t wr_id, uint32_t op, 
   char line[640];
   const int n = std::snprintf(
       line, sizeof(line),
-      R"({"id":%llu,"name":"%s","cat":"rdma_hwts","type":"rdma","pid":%ld,"tid":%d,"ts":%llu,"dur":0,"ph":1,"args":{"hhash":"%s","aligned":%d,"raw_ns":%llu,"phc":%d,"wr_id":%llu,"opcode":%u,"imm":%u,"qp":%u}})"
+      R"({"id":%llu,"name":"%s","cat":"rdma_hwts","type":"rdma","pid":%ld,"tid":%d,"ts":%llu,"dur":0,"ph":1,"args":{"hhash":"%s","aligned":%d,"raw_ns":%llu,"phc":%d,"wr_id":%llu,"opcode":%u,"imm":%u,"qp":%u,"wqe":%u}})"
       "\n",
       static_cast<unsigned long long>(s->id.fetch_add(1)), opcode_name(op), tid(), getpid(),
       static_cast<unsigned long long>(ref_ns / 1000), s->hhash.c_str(), ref_ns != 0 ? 1 : 0,
       static_cast<unsigned long long>(raw_ns), phc, static_cast<unsigned long long>(wr_id), op, imm,
-      qp);
+      qp, wqe);
   if (n <= 0) return;
   std::lock_guard<std::mutex> lock(s->mu);
   s->buf.append(line, static_cast<std::size_t>(n));
@@ -586,6 +589,12 @@ void dc_doca_on_leave(GumInvocationListener*, GumInvocationContext* ic) {
   const uint64_t hw = __builtin_bswap64(*reinterpret_cast<const volatile uint64_t*>(c + 48));
   const uint32_t op = c[63] >> 4;  // 0 = send, 2/3 = recv
   const uint32_t imm = __builtin_bswap32(*reinterpret_cast<const volatile uint32_t*>(c + 36));
+  // mlx5_cqe64: sop_drop_qpn at 56 (QP in the low 24 bits), wqe_counter at 60. Together they give
+  // "which queue, which position", so pairing a send with its receive is checkable rather than
+  // assumed: a gap or a repeat in the counter shows the pairing slipped.
+  const uint32_t qpn =
+      __builtin_bswap32(*reinterpret_cast<const volatile uint32_t*>(c + 56)) & 0xffffff;
+  const uint32_t wqe = __builtin_bswap16(*reinterpret_cast<const volatile uint16_t*>(c + 60));
   // Prefer the daemon's raw->global fit (drift-free, no local clock work). Fall back to the local
   // raw->mono anchor when the daemon publishes no raw fit (DC_TIMESYNC_RAW_DEV unset). ref=0 when
   // neither is available -> raw_ns is kept unaligned.
@@ -604,7 +613,7 @@ void dc_doca_on_leave(GumInvocationListener*, GumInvocationContext* ic) {
       if (mono > 0) ref = s->reader.remap(static_cast<uint64_t>(mono));
     }
   }
-  emit_record(ref, hw, 0, op == 0 ? 260 : 261, imm, 0, -1);
+  emit_record(ref, hw, 0, op == 0 ? 260 : 261, imm, qpn, -1, wqe);
 }
 void dc_doca_listener_iface_init(gpointer g_iface, gpointer) {
   auto* i = static_cast<GumInvocationListenerInterface*>(g_iface);

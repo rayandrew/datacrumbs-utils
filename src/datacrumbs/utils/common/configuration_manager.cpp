@@ -430,6 +430,9 @@ ConfigurationManager::ConfigurationManager(int argc, char** argv, bool load_capt
             probe->stack_dump_ratio = probe_node["stack_dump_ratio"]
                                           ? probe_node["stack_dump_ratio"].as<unsigned int>()
                                           : 0;
+            if (probe_node["gate_tid_arg"]) {
+              probe->gate_tid_arg = probe_node["gate_tid_arg"].as<std::string>();
+            }
             probe->hot_exclude =
                 probe_node["hot_exclude_glob"]
                     ? datacrumbs::utils::glob_to_regex(

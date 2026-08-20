@@ -1504,6 +1504,7 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::extractProbes() {
     probe->capture_stack = capture_probe->capture_stack;        // grab user stack at tracepoints
     probe->sample_freq = capture_probe->sample_freq;            // perf_event sampling rate
     probe->stack_dump_ratio = capture_probe->stack_dump_ratio;  // 1-in-N raw stack dumps
+    probe->gate_tid_arg = capture_probe->gate_tid_arg;
 
     // For syscall probes, normalize to base syscall names expected by attach_ksyscall.
     if (capture_probe->probe_type == ProbeType::SYSCALLS) {

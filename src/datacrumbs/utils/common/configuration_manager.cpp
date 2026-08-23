@@ -430,6 +430,26 @@ ConfigurationManager::ConfigurationManager(int argc, char** argv, bool load_capt
             probe->stack_dump_ratio = probe_node["stack_dump_ratio"]
                                           ? probe_node["stack_dump_ratio"].as<unsigned int>()
                                           : 0;
+            // Explicit per-function arg capture. Never parsed before this: the key was accepted
+            // by the schema and silently dropped, so every spec fell back to auto-discovery (DWARF
+            // for uprobes, tracefs for tracepoints) and offsets written here had no effect.
+            if (probe_node["function_arguments"]) {
+              for (const auto& entry : probe_node["function_arguments"]) {
+                const auto fn = entry.first.as<std::string>();
+                std::vector<ProbeArgCaptureSpec> specs;
+                for (const auto& a : entry.second) {
+                  ProbeArgCaptureSpec spec;
+                  if (a["label"]) spec.label = a["label"].as<std::string>();
+                  if (a["c_type"]) spec.c_type = a["c_type"].as<std::string>();
+                  if (a["index"]) spec.index = a["index"].as<unsigned int>();
+                  if (a["offset"]) spec.offset = a["offset"].as<unsigned int>();
+                  if (a["num_bytes"]) spec.num_bytes = a["num_bytes"].as<unsigned int>();
+                  if (a["is_pointer"]) spec.is_pointer = a["is_pointer"].as<bool>();
+                  specs.push_back(std::move(spec));
+                }
+                if (!specs.empty()) probe->function_arguments[fn] = std::move(specs);
+              }
+            }
             if (probe_node["gate_tid_arg"]) {
               probe->gate_tid_arg = probe_node["gate_tid_arg"].as<std::string>();
             }

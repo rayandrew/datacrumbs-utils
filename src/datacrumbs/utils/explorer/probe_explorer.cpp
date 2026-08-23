@@ -1663,6 +1663,11 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::extractProbes() {
     probe->functions = functionNames;
     attach_discovered_function_signatures(probe.get(), capture_probe->probe_type, functionNames,
                                           discovered_function_signatures);
+    // Last, so an explicit spec beats a discovered signature: the tracefs auto-parse fills
+    // MAX_CAPTURE_ARGS in file order and never reaches sched_switch's next_pid.
+    for (const auto& [fn, specs] : capture_probe->function_arguments) {
+      probe->function_arguments[fn] = specs;
+    }
 
     // Validate the probe before adding
     if (!probe->validate()) {

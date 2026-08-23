@@ -430,9 +430,8 @@ ConfigurationManager::ConfigurationManager(int argc, char** argv, bool load_capt
             probe->stack_dump_ratio = probe_node["stack_dump_ratio"]
                                           ? probe_node["stack_dump_ratio"].as<unsigned int>()
                                           : 0;
-            // Explicit per-function arg capture. Never parsed before this: the key was accepted
-            // by the schema and silently dropped, so every spec fell back to auto-discovery (DWARF
-            // for uprobes, tracefs for tracepoints) and offsets written here had no effect.
+            // Explicit per-function arg capture; overrides auto-discovery (DWARF for uprobes,
+            // tracefs for tracepoints).
             if (probe_node["function_arguments"]) {
               for (const auto& entry : probe_node["function_arguments"]) {
                 const auto fn = entry.first.as<std::string>();

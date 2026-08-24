@@ -15,7 +15,7 @@
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <datacrumbs/common/pfw_format.h>
-#include <datacrumbs/utils/timesync/timesync_reader.h>
+#include <datacrumbs/utils/client/pfw_sink.h>
 #include <dirent.h>
 #include <dlfcn.h>
 #include <infiniband/verbs.h>
@@ -97,53 +97,11 @@ int sample_n() {
 }
 thread_local unsigned long long g_sample_ctr = 0;
 
-// Per-process .pfw sink: global-epoch COMPLETE records written as multi-member gzip.
-struct Sink {
-  datacrumbs::timesync::Reader reader;
-  std::string hhash;
-  std::mutex mu;
-  std::string buf;
-  std::FILE* file = nullptr;
-  std::atomic<uint64_t> id{0};
-
-  void flush_locked() {
-    if (buf.empty() || file == nullptr) return;
-    const std::vector<uint8_t> member = datacrumbs::pfw::gzip_block(buf);
-    std::fwrite(member.data(), 1, member.size(), file);
-    std::fflush(file);
-    buf.clear();
-  }
-};
-Sink* g_sink = nullptr;
+datacrumbs::client::PfwSink* g_sink = nullptr;
 std::once_flag g_once;
 
 void sink_init() {
-  auto* s = new Sink();
-  s->reader.map();
-  char host[256] = {0};
-  gethostname(host, sizeof(host) - 1);
-  s->hhash = datacrumbs::pfw::hhash(host);
-  const char* dir = std::getenv("DC_HWTS_OUT");
-  if (dir == nullptr || *dir == '\0') dir = std::getenv("DATACRUMBS_LOG_DIR");
-  if (dir == nullptr || *dir == '\0') dir = "/tmp";
-  char path[1024];
-  std::snprintf(path, sizeof(path), "%s/trace-rdma-%d-%s.pfw.gz", dir, getpid(), host);
-  mkdir(dir, 0755);  // callers pass a per-run dir; without this fopen just fails
-  s->file = std::fopen(path, "wb");
-  if (s->file == nullptr) {
-    // capture is opt-in, so a sink we cannot write is a silent total loss of the very data that
-    // was asked for: every record would be dropped and the run would look merely empty.
-    fprintf(stderr, "[dc-hwts] FATAL: cannot open %s: %s\n", path, strerror(errno));
-    _exit(1);
-  }
-  char hh[512];
-  const int n = std::snprintf(
-      hh, sizeof(hh),
-      R"({"name":"HH","cat":"dftracer","type":"metadata","ph":4,"args":{"hhash":"%s","name":"%s","value":"%s"}})"
-      "\n",
-      s->hhash.c_str(), host, s->hhash.c_str());
-  s->buf.append(hh, static_cast<std::size_t>(n));
-  g_sink = s;
+  g_sink = new datacrumbs::client::PfwSink("rdma", "DC_HWTS_OUT");
 }
 
 const char* opcode_name(uint32_t op) {
@@ -179,7 +137,7 @@ const char* opcode_name(uint32_t op) {
 // has none. Kept separate from wr_id so the two are never confused by a consumer.
 void emit_record(uint64_t ref_ns, uint64_t raw_ns, uint64_t wr_id, uint32_t op, uint32_t imm,
                  uint32_t qp, int phc, uint32_t wqe = 0) {
-  Sink* s = g_sink;
+  datacrumbs::client::PfwSink* s = g_sink;
   if (s == nullptr) return;
   if (op != 250 && op != 251) {  // markers are join keys, never sampled out
     const int nth = sample_n();
@@ -190,23 +148,22 @@ void emit_record(uint64_t ref_ns, uint64_t raw_ns, uint64_t wr_id, uint32_t op, 
       line, sizeof(line),
       R"({"id":%llu,"name":"%s","cat":"rdma_hwts","type":"rdma","pid":%ld,"tid":%d,"ts":%llu,"dur":0,"ph":1,"args":{"hhash":"%s","aligned":%d,"raw_ns":%llu,"phc":%d,"wr_id":%llu,"opcode":%u,"imm":%u,"qp":%u,"wqe":%u}})"
       "\n",
-      static_cast<unsigned long long>(s->id.fetch_add(1)), opcode_name(op), tid(), getpid(),
-      static_cast<unsigned long long>(ref_ns / 1000), s->hhash.c_str(), ref_ns != 0 ? 1 : 0,
+      static_cast<unsigned long long>(s->next_id()), opcode_name(op), tid(), getpid(),
+      static_cast<unsigned long long>(ref_ns / 1000), s->hhash().c_str(), ref_ns != 0 ? 1 : 0,
       static_cast<unsigned long long>(raw_ns), phc, static_cast<unsigned long long>(wr_id), op, imm,
       qp, wqe);
   if (n <= 0) return;
-  std::lock_guard<std::mutex> lock(s->mu);
-  s->buf.append(line, static_cast<std::size_t>(n));
-  if (s->buf.size() >= 256 * 1024) s->flush_locked();
+  s->write(line, static_cast<std::size_t>(n));
 }
 
 // ibverbs completion: hw is a PHC-domain ns; remap through the per-PHC dc_timesync fit. hw==0 is a
 // CPU-time marker (post/doorbell) -> stamp it now on CLOCK_MONOTONIC remapped to the global epoch,
 // not ts=0, so the marker lands at the post instant on the shared timeline.
 void emit(uint64_t hw_ns, uint64_t wr_id, uint32_t op, uint32_t imm, uint32_t qp, int phc) {
-  Sink* s = g_sink;
+  datacrumbs::client::PfwSink* s = g_sink;
   if (s == nullptr) return;
-  const uint64_t ref = hw_ns != 0 ? s->reader.remap_hw(hw_ns, phc) : s->reader.remap(mono_ns());
+  const uint64_t ref =
+      hw_ns != 0 ? s->clock().remap_hw(hw_ns, phc) : s->clock().remap(mono_ns());
   emit_record(ref, hw_ns, wr_id, op, imm, qp, phc);
 }
 
@@ -497,11 +454,8 @@ extern "C" __attribute__((noinline, visibility("default"))) void datacrumbs_rdma
 
 namespace {
 __attribute__((destructor)) void rdma_hwts_fini() {
-  Sink* s = g_sink;
-  if (s == nullptr) return;
-  std::lock_guard<std::mutex> lock(s->mu);
-  s->flush_locked();
-  if (s->file != nullptr) std::fclose(s->file);
+  delete g_sink;  // flushes and closes
+  g_sink = nullptr;
 }
 }  // namespace
 
@@ -599,9 +553,9 @@ void dc_doca_on_leave(GumInvocationListener*, GumInvocationContext* ic) {
   // raw->mono anchor when the daemon publishes no raw fit (DC_TIMESYNC_RAW_DEV unset). ref=0 when
   // neither is available -> raw_ns is kept unaligned.
   uint64_t ref = 0;
-  Sink* s = g_sink;
+  datacrumbs::client::PfwSink* s = g_sink;
   if (s != nullptr) {
-    ref = s->reader.remap_raw(hw);
+    ref = s->clock().remap_raw(hw);
     if (ref == 0 && g_anchor.valid.load(std::memory_order_relaxed)) {
       // Time-based re-anchor (not count-based: low-rate DOCA would never re-fire): >50ms bounds the
       // ~1ppm HCA<->CPU drift to <=50ns, so the fallback mapping stays sub-us.
@@ -610,7 +564,7 @@ void dc_doca_on_leave(GumInvocationListener*, GumInvocationContext* ic) {
         doca_sample_anchor();
       const int64_t mono =
           static_cast<int64_t>(hw) - g_anchor.raw_minus_mono.load(std::memory_order_relaxed);
-      if (mono > 0) ref = s->reader.remap(static_cast<uint64_t>(mono));
+      if (mono > 0) ref = s->clock().remap(static_cast<uint64_t>(mono));
     }
   }
   emit_record(ref, hw, 0, op == 0 ? 260 : 261, imm, qpn, -1, wqe);

@@ -5,7 +5,7 @@
 
 #define _GNU_SOURCE
 #include <datacrumbs/common/pfw_format.h>
-#include <datacrumbs/utils/timesync/timesync_reader.h>
+#include <datacrumbs/utils/client/pfw_sink.h>
 #include <dlfcn.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -25,28 +25,13 @@ namespace {
 // Reentrancy guard: our own writer does I/O (fwrite -> write), which would re-enter these wrappers.
 thread_local bool g_in_trace = false;
 
-constexpr std::size_t kFlushBytes = 256 * 1024;
-
-// All tracer state on the heap behind a POD pointer set in the constructor. A std::string global
-// would be wiped by its own dynamic initializer running AFTER the constructor attribute.
+// State on the heap behind a POD pointer set in the constructor. A std::string global would be
+// wiped by its own dynamic initializer running AFTER the constructor attribute.
 struct State {
-  datacrumbs::timesync::Reader reader;
-  std::string hhash;
-  std::mutex mu;
-  std::string buf;
-  std::FILE* file = nullptr;
-  std::atomic<uint64_t> id{0};
+  datacrumbs::client::PfwSink* sink = nullptr;
   struct {
     bool read, write, pread, pwrite, close, fsync;
   } on{};
-
-  void flush_locked() {
-    if (buf.empty() || file == nullptr) return;
-    const std::vector<uint8_t> member = datacrumbs::pfw::gzip_block(buf);
-    std::fwrite(member.data(), 1, member.size(), file);
-    std::fflush(file);
-    buf.clear();
-  }
 };
 
 State* g_state = nullptr;
@@ -62,7 +47,7 @@ void emit(const char* name, unsigned long long t0_mono, unsigned long long t1_mo
   State* s = g_state;
   if (s == nullptr) return;
   g_in_trace = true;
-  const unsigned long long ts_us = s->reader.remap(t0_mono) / 1000;
+  const unsigned long long ts_us = s->sink->clock().remap(t0_mono) / 1000;
   const unsigned long long dur_ns = t1_mono > t0_mono ? t1_mono - t0_mono : 0;
   const unsigned long long dur_us = dur_ns / 1000 + (dur_ns % 1000 != 0 ? 1 : 0);
   char line[512];
@@ -70,13 +55,9 @@ void emit(const char* name, unsigned long long t0_mono, unsigned long long t1_mo
       line, sizeof(line),
       R"({"id":%llu,"name":"%s","cat":"libc","type":"interpose","pid":%ld,"tid":%d,"ts":%llu,"dur":%llu,"ph":1,"args":{"hhash":"%s"}})"
       "\n",
-      static_cast<unsigned long long>(s->id.fetch_add(1)), name,
-      static_cast<long>(syscall(SYS_gettid)), getpid(), ts_us, dur_us, s->hhash.c_str());
-  if (n > 0) {
-    std::lock_guard<std::mutex> lock(s->mu);
-    s->buf.append(line, static_cast<std::size_t>(n));
-    if (s->buf.size() >= kFlushBytes) s->flush_locked();
-  }
+      static_cast<unsigned long long>(s->sink->next_id()), name,
+      static_cast<long>(syscall(SYS_gettid)), getpid(), ts_us, dur_us, s->sink->hhash().c_str());
+  if (n > 0) s->sink->write(line, static_cast<std::size_t>(n));
   g_in_trace = false;
 }
 
@@ -97,30 +78,16 @@ bool enabled(const char* env, const char* name) {
 __attribute__((constructor)) void interpose_init() {
   g_in_trace = true;  // suppress tracing of our own setup I/O
   auto* s = new State();
-  s->reader.map();
-  char host[256] = {0};
-  gethostname(host, sizeof(host) - 1);
-  s->hhash = datacrumbs::pfw::hhash(host);
-
-  const char* dir = std::getenv("DATACRUMBS_LOG_DIR");
-  if (dir == nullptr || *dir == '\0') dir = "/tmp";
+  // $USER stays in the file name: /tmp is shared, so two users tracing at once would collide.
   const char* user = std::getenv("USER");
   if (user == nullptr || *user == '\0') user = "unknown";
-  char path[1024];
-  std::snprintf(path, sizeof(path), "%s/trace-interpose-%s-%d-%s.pfw.gz", dir, user, getpid(), host);
-  s->file = std::fopen(path, "wb");
+  char tag[128];
+  std::snprintf(tag, sizeof(tag), "interpose-%s", user);
+  s->sink = new datacrumbs::client::PfwSink(tag, nullptr);
 
   const char* env = std::getenv("DATACRUMBS_INTERPOSE");
   s->on = {enabled(env, "read"), enabled(env, "write"), enabled(env, "pread64"),
            enabled(env, "pwrite64"), enabled(env, "close"), enabled(env, "fsync")};
-
-  char hh[512];
-  const int n = std::snprintf(
-      hh, sizeof(hh),
-      R"({"name":"HH","cat":"dftracer","type":"metadata","ph":4,"args":{"hhash":"%s","name":"%s","value":"%s"}})"
-      "\n",
-      s->hhash.c_str(), host, s->hhash.c_str());
-  s->buf.append(hh, static_cast<std::size_t>(n));
 
   g_state = s;
   g_in_trace = false;
@@ -131,11 +98,7 @@ __attribute__((destructor)) void interpose_fini() {
   g_state = nullptr;
   if (s == nullptr) return;
   g_in_trace = true;
-  {
-    std::lock_guard<std::mutex> lock(s->mu);
-    s->flush_locked();
-  }
-  if (s->file != nullptr) std::fclose(s->file);
+  delete s->sink;  // flushes and closes
 }
 
 }  // namespace

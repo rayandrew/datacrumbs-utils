@@ -346,6 +346,7 @@ set(DATACRUMBS_UTILS_COMMON_SRC
 set(DATACRUMBS_UTILS_CLIENT_SRC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/utils/client/library.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/utils/client/library.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/utils/client/pfw_sink.h"
 )
 add_library(datacrumbs_client SHARED ${DATACRUMBS_UTILS_CLIENT_SRC})
 set_target_properties(
@@ -354,7 +355,8 @@ set_target_properties(
     OUTPUT_NAME datacrumbs_client
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}"
 )
-target_link_libraries(datacrumbs_client ${DATACRUMBS_PUBLIC_COMMON_LIBRARY})
+target_link_libraries(datacrumbs_client ${DATACRUMBS_PUBLIC_COMMON_LIBRARY} OpenSSL::Crypto
+                      ZLIB::ZLIB)
 install(TARGETS datacrumbs_client LIBRARY DESTINATION "${DATACRUMBS_INSTALL_LIB_DIR}")
 
 add_custom_target(

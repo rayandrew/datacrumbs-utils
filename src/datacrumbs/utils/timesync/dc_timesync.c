@@ -18,6 +18,7 @@
 // arm NIC timestamping via SIOCSHWTSTAMP.
 
 #define _GNU_SOURCE
+#include <datacrumbs/utils/common/constants.h>
 #include <arpa/inet.h>
 #include <datacrumbs/common/dc_timesync_snapshot.h>
 #include <errno.h>
@@ -484,7 +485,7 @@ int main(int argc, char** argv) {
   const char *iface = argv[1], *role = argv[2];
 
   if (strcmp(role, "dump") == 0) {  // inspect the published snapshot (no NIC/sudo needed)
-    const char* snap_path = getenv("DC_TIMESYNC_SNAPSHOT");
+    const char* snap_path = getenv(DATACRUMBS_ENV_TIMESYNC_SNAPSHOT);
     if (!snap_path) snap_path = DC_TIMESYNC_DEFAULT_PATH;
     struct dc_timesync_snapshot* shm = map_snapshot_ro(snap_path);
     if (!shm) return 1;
@@ -527,13 +528,13 @@ int main(int argc, char** argv) {
     uint32_t self_id = (uint32_t)atoi(argv[3]);
     uint32_t ref_id = (uint32_t)atoi(argv[4]);
     int cadence_ms = argc > 6 ? atoi(argv[6]) : 1000;
-    const char* snap_path = getenv("DC_TIMESYNC_SNAPSHOT");
+    const char* snap_path = getenv(DATACRUMBS_ENV_TIMESYNC_SNAPSHOT);
     if (!snap_path) snap_path = DC_TIMESYNC_DEFAULT_PATH;
     struct dc_timesync_snapshot* shm = map_snapshot(snap_path);
     if (!shm) return 1;
     printf("# daemon self=%u ref=%u cadence=%dms snapshot=%s\n", self_id, ref_id, cadence_ms,
            snap_path);
-    const char* raw_dev = getenv("DC_TIMESYNC_RAW_DEV");  // fabric ib device -> publish raw-clock fit
+    const char* raw_dev = getenv(DATACRUMBS_ENV_TIMESYNC_RAW_DEV);  // fabric ib device -> publish raw-clock fit
     if (raw_dev && *raw_dev) raw_open(raw_dev);
 
     if (self_id == ref_id) {

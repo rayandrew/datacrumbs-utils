@@ -1,12 +1,13 @@
 // Plugin: attach hardware perf counters (DATACRUMBS_HW_COUNTERS, cpu-scope) and name the per-event
-// entry->exit deltas the core BPF captures. Core owns the capture-time read (it must run in-kernel on
-// the event's cpu); this plugin owns the policy: which counters, opening them, and labeling. IPC is
-// left to analysis (store raw instructions + cycles). Loaded via DATACRUMBS_PLUGINS.
+// entry->exit deltas the core BPF captures. Core owns the capture-time read (it must run in-kernel
+// on the event's cpu); this plugin owns the policy: which counters, opening them, and labeling. IPC
+// is left to analysis (store raw instructions + cycles). Loaded via DATACRUMBS_PLUGINS.
 
 #include <datacrumbs/common/constants.h>
 #include <datacrumbs/common/data_structures.h>
 #include <datacrumbs/common/logging.h>
 #include <datacrumbs/common/plugin_api.h>
+#include <datacrumbs/utils/common/configuration_manager.h>
 #include <linux/bpf.h>
 #include <linux/perf_event.h>
 #include <sys/syscall.h>
@@ -45,7 +46,8 @@ const CounterKind* lookup_kind(const std::string& name) {
 }
 
 std::vector<std::string> parse_counter_list() {
-  const char* env = std::getenv("DATACRUMBS_HW_COUNTERS");
+  const std::string& counters = datacrumbs::ConfigurationManager::runtime().hw_counters;
+  const char* env = counters.c_str();
   std::vector<std::string> names;
   if (env == nullptr || *env == '\0') return names;
   std::string spec(env);

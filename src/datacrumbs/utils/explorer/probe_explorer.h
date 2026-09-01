@@ -73,6 +73,7 @@ class ProbeExplorer {
    * @return true on success, false on write/serialization failure.
    */
   bool writeSystemProbeJson();
+  bool writeClientConfig(const std::filesystem::path& probe_path);
 
   /**
    * @brief Load existing probes from a previously generated JSON file.

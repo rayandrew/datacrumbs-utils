@@ -288,8 +288,14 @@ int main(int argc, char* argv[]) {
     return EXIT_FAILURE;
   }
   fseek(fp, 0, SEEK_END);
-  long file_size = ftell(fp);
+  const long ftell_size = ftell(fp);
   fseek(fp, 0, SEEK_SET);
+  if (ftell_size < 0) {
+    perror("Error reading file");
+    fclose(fp);
+    return EXIT_FAILURE;
+  }
+  const size_t file_size = static_cast<size_t>(ftell_size);
   char* buffer = (char*)malloc(file_size + 1);
   if (!buffer || fread(buffer, 1, file_size, fp) != file_size) {
     perror("Error reading file");

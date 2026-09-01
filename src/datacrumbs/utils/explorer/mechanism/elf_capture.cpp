@@ -78,7 +78,6 @@ std::vector<std::string> ElfSymbolExtractor::extract_symbols() {
 
   const Elf64_Ehdr* ehdr = reinterpret_cast<const Elf64_Ehdr*>(data_);
   const Elf64_Shdr* shdrs = reinterpret_cast<const Elf64_Shdr*>(data_ + ehdr->e_shoff);
-  const char* shstrtab = reinterpret_cast<const char*>(data_ + shdrs[ehdr->e_shstrndx].sh_offset);
 
   // First pass: count symbol occurrences
   for (int i = 0; i < ehdr->e_shnum; ++i) {

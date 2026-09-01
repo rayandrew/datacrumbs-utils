@@ -22,14 +22,6 @@
 #include <unordered_map>
 #include <unordered_set>
 
-// Singleton statics for TracepointCapture (mirrors ksym_capture.cpp for KSymCapture); the mechanism
-// is header-only, so its sole consumer defines them here.
-template <>
-std::shared_ptr<datacrumbs::TracepointCapture>
-    datacrumbs::Singleton<datacrumbs::TracepointCapture>::instance = nullptr;
-template <>
-bool datacrumbs::Singleton<datacrumbs::TracepointCapture>::stop_creating_instances = false;
-
 namespace {
 
 std::string probe_signing_payload(json_object* summary, json_object* categories) {
@@ -43,46 +35,6 @@ std::string probe_signing_payload(json_object* summary, json_object* categories)
   return result;
 }
 
-const char* probe_type_to_string(datacrumbs::ProbeType type) {
-  switch (type) {
-    case datacrumbs::ProbeType::SYSCALLS:
-      return "syscalls";
-    case datacrumbs::ProbeType::KPROBE:
-      return "kprobe";
-    case datacrumbs::ProbeType::UPROBE:
-      return "uprobe";
-    case datacrumbs::ProbeType::USDT:
-      return "usdt";
-    case datacrumbs::ProbeType::CUSTOM:
-      return "custom";
-    case datacrumbs::ProbeType::TRACEPOINT:
-      return "tracepoint";
-    case datacrumbs::ProbeType::PERF_EVENT:
-      return "perf_event";
-  }
-  return "unknown";
-}
-
-const char* capture_type_to_string(datacrumbs::CaptureType type) {
-  switch (type) {
-    case datacrumbs::CaptureType::HEADER:
-      return "header";
-    case datacrumbs::CaptureType::BINARY:
-      return "binary";
-    case datacrumbs::CaptureType::KSYM:
-      return "ksym";
-    case datacrumbs::CaptureType::USDT:
-      return "usdt";
-    case datacrumbs::CaptureType::CUSTOM:
-      return "custom";
-    case datacrumbs::CaptureType::TRACEPOINT:
-      return "tracepoint";
-    case datacrumbs::CaptureType::PERF_EVENT:
-      return "perf_event";
-  }
-  return "unknown";
-}
-
 // The sampler's "functions" are perf event names, not symbols, so there is nothing to enumerate:
 // match the regex against the set the server can translate to a perf_event_attr.
 std::vector<std::string> perf_events_by_regex(const std::string& pattern) {
@@ -93,10 +45,6 @@ std::vector<std::string> perf_events_by_regex(const std::string& pattern) {
     if (std::regex_search(event, re)) result.push_back(event);
   }
   return result;
-}
-
-json_object* string_or_empty_json(const char* value) {
-  return json_object_new_string(value ? value : "");
 }
 
 std::string trim_copy(std::string value) {
@@ -751,69 +699,6 @@ void attach_discovered_function_signatures(
   }
 }
 
-json_object* capture_probe_to_json(const std::shared_ptr<datacrumbs::CaptureProbe>& capture_probe) {
-  json_object* config = json_object_new_object();
-  json_object_object_add(config, "name", json_object_new_string(capture_probe->name.c_str()));
-  json_object_object_add(config, "capture_type",
-                         json_object_new_string(capture_type_to_string(capture_probe->type)));
-  json_object_object_add(config, "probe_type",
-                         json_object_new_string(probe_type_to_string(capture_probe->probe_type)));
-  json_object_object_add(config, "regex", json_object_new_string(capture_probe->regex.c_str()));
-  json_object_object_add(config, "enable_explorer",
-                         json_object_new_boolean(capture_probe->enable_explorer));
-  if (!capture_probe->function_arguments.empty()) {
-    json_object* function_arguments = json_object_new_object();
-    for (const auto& [function_name, arg_specs] : capture_probe->function_arguments) {
-      json_object* arg_list = json_object_new_array();
-      for (const auto& arg_spec : arg_specs) {
-        json_object_array_add(arg_list, arg_spec.toJson());
-      }
-      json_object_object_add(function_arguments, function_name.c_str(), arg_list);
-    }
-    json_object_object_add(config, "function_arguments", function_arguments);
-  }
-
-  switch (capture_probe->type) {
-    case datacrumbs::CaptureType::HEADER: {
-      auto header_probe = std::static_pointer_cast<datacrumbs::HeaderCaptureProbe>(capture_probe);
-      json_object_object_add(config, "file", json_object_new_string(header_probe->file.c_str()));
-      break;
-    }
-    case datacrumbs::CaptureType::BINARY: {
-      auto binary_probe = std::static_pointer_cast<datacrumbs::BinaryCaptureProbe>(capture_probe);
-      json_object_object_add(config, "file", json_object_new_string(binary_probe->file.c_str()));
-      json_object_object_add(config, "include_offsets",
-                             json_object_new_boolean(binary_probe->include_offsets));
-      break;
-    }
-    case datacrumbs::CaptureType::USDT: {
-      auto usdt_probe = std::static_pointer_cast<datacrumbs::USDTCaptureProbe>(capture_probe);
-      json_object_object_add(config, "binary_path",
-                             json_object_new_string(usdt_probe->binary_path.c_str()));
-      json_object_object_add(config, "provider",
-                             json_object_new_string(usdt_probe->provider.c_str()));
-      break;
-    }
-    case datacrumbs::CaptureType::CUSTOM: {
-      auto custom_probe = std::static_pointer_cast<datacrumbs::CustomCaptureProbe>(capture_probe);
-      json_object_object_add(config, "file",
-                             json_object_new_string(custom_probe->bpf_file.c_str()));
-      json_object_object_add(config, "probes",
-                             json_object_new_string(custom_probe->probe_file.c_str()));
-      json_object_object_add(config, "start_event_id",
-                             json_object_new_int64(custom_probe->start_event_id));
-      json_object_object_add(config, "process_header",
-                             json_object_new_string(custom_probe->process_header.c_str()));
-      json_object_object_add(config, "event_type", json_object_new_int64(custom_probe->event_type));
-      break;
-    }
-    case datacrumbs::CaptureType::KSYM:
-      break;
-  }
-
-  return config;
-}
-
 json_object* configured_environment_to_json() {
   static const char* kEnvVars[] = {
       "DATACRUMBS_VERSION",
@@ -857,7 +742,8 @@ json_object* configured_environment_to_json() {
 
   json_object* env_json = json_object_new_object();
   for (const char* env_var : kEnvVars) {
-    json_object_object_add(env_json, env_var, string_or_empty_json(std::getenv(env_var)));
+    const std::string value = datacrumbs::ConfigurationManager::env_text(env_var);
+    json_object_object_add(env_json, env_var, json_object_new_string(value.c_str()));
   }
   return env_json;
 }
@@ -990,7 +876,7 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::extractProbes() {
   DC_LOG_DEBUG("Exclusion Map Contents:");
   for (const auto& [probe_name, func_set] : exclusionMap) {
     DC_LOG_DEBUG("Probe: %s", probe_name.c_str());
-    for (const auto& func : func_set) {
+    for ([[maybe_unused]] const auto& func : func_set) {
       DC_LOG_DEBUG("  Excluded Function: %s", func.c_str());
     }
   }
@@ -2081,12 +1967,61 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::writeProbesToJson() {
     signing_failed_ = true;
   } else {
     DC_LOG_INFO("Signed probe file written: %s", configManager_->probe_file_path.c_str());
+    if (!writeClientConfig(configManager_->probe_file_path)) signing_failed_ = true;
   }
 
   json_object_put(root);
   json_object_put(jarray);
   DC_LOG_TRACE("ProbeExplorer::writeProbesToJson - end");
   return probes;
+}
+
+/// Resolve the yaml's client module layers into the settings the preloaded client reads.
+///
+/// Written beside the probe file as KEY=VALUE, which is all the client can parse: it is injected
+/// into every traced process, where json and zlib would be two dependencies too many.
+bool ProbeExplorer::writeClientConfig(const std::filesystem::path& probe_path) {
+  const auto& layers = configManager_->client_layers;
+
+  static const std::unordered_map<std::string, std::string> kEnvOf = {
+      {"posix", "POSIX"},   {"stdio", "STDIO"},           {"vendor_api", "API"},
+      {"doca_engine", "DOCA_ENGINE"}, {"ibverbs_hwts", "HWTS"}};
+  static const std::unordered_map<std::string, std::string> kEnableOf = {
+      {"posix", "DATACRUMBS_POSIX"},         {"stdio", "DATACRUMBS_STDIO"},
+      {"vendor_api", "DATACRUMBS_API"},      {"doca_engine", "DATACRUMBS_ENGINE"},
+      {"ibverbs_hwts", "DATACRUMBS_HWTS"}};
+
+  std::map<std::string, std::string> out;
+  for (const auto& l : layers) {
+    const auto env = kEnvOf.find(l.module);
+    if (env == kEnvOf.end()) {
+      DC_LOG_ERROR("capture probe '%s' names unknown module '%s'", l.name.c_str(),
+                   l.module.c_str());
+      return false;
+    }
+    out[kEnableOf.at(l.module)] = "1";
+    if (l.pattern.empty()) continue;
+    const char* which = l.off ? "OFF" : (l.aggregate ? "AGGREGATE" : "RECORD");
+    std::string& slot = out["DATACRUMBS_" + env->second + "_" + which];
+    if (!slot.empty()) slot += ",";
+    // Marked, because the client reads a bare pattern as a glob and the yaml's two keys mean
+    // different things.
+    if (l.is_regex) slot += "regex:";
+    slot += l.pattern;
+  }
+
+  const std::filesystem::path path = probe_path.string() + ".client";
+  std::ofstream f(path);
+  if (!f.is_open()) {
+    DC_LOG_ERROR("Failed to write client configuration: %s", path.string().c_str());
+    return false;
+  }
+  // Written even with nothing in it. A run names this path unconditionally, so absent means the
+  // configurator failed, and empty means the probeset asked for no client module.
+  for (const auto& [k, v] : out) f << k << "=" << v << "\n";
+  DC_LOG_INFO("client configuration: %zu settings from %zu layers -> %s", out.size(), layers.size(),
+              path.string().c_str());
+  return true;
 }
 
 bool ProbeExplorer::writeSystemProbeJson() {
@@ -2119,6 +2054,8 @@ bool ProbeExplorer::writeSystemProbeJson() {
                  configManager_->system_probe_path.string().c_str());
     return false;
   }
+
+  if (!writeClientConfig(configManager_->system_probe_path)) return false;
 
   DC_LOG_INFO("Compressed system probe written to: %s",
               configManager_->system_probe_path.string().c_str());

@@ -39,6 +39,7 @@
 #include <datacrumbs/common/singleton.h>
 #include <datacrumbs/common/utils.h>
 #include <datacrumbs/utils/common/configuration_manager.h>
+#include <datacrumbs/utils/common/constants.h>
 /**
  * External headers
  */
@@ -62,15 +63,6 @@ std::string runtime_timestamp() {
   std::ostringstream oss;
   oss << std::put_time(&tm_now, "%Y%m%d%H%M%S");
   return oss.str();
-}
-
-std::string json_string_or_empty(json_object* root, const char* key) {
-  json_object* value = nullptr;
-  if (!root || !json_object_object_get_ex(root, key, &value) ||
-      json_object_get_type(value) != json_type_string) {
-    return "";
-  }
-  return json_object_get_string(value);
 }
 
 std::shared_ptr<Probe> probe_from_json(json_object* probe_obj) {
@@ -121,13 +113,6 @@ std::string pattern_of(const YAML::Node& probe_node) {
 }
 
 }  // namespace
-
-// Singleton template specialization for ConfigurationManager
-template <>
-std::shared_ptr<datacrumbs::ConfigurationManager>
-    datacrumbs::Singleton<datacrumbs::ConfigurationManager>::instance = nullptr;
-template <>
-bool datacrumbs::Singleton<datacrumbs::ConfigurationManager>::stop_creating_instances = false;
 
 /**
  * YAML keys for configuration
@@ -309,6 +294,22 @@ ConfigurationManager::ConfigurationManager(int argc, char** argv, bool load_capt
       } else {
         DC_LOG_TRACE("[ConfigurationManager] Parsing capture probes...");
         for (const auto& probe_node : config[DC_YAML_CAPTURE_PROBES]) {
+          // A client module is named, not probed: it is already wrapped in userspace, so the layer
+          // says which module and which calls rather than which mechanism.
+          if (probe_node["module"]) {
+            ClientLayer layer;
+            layer.module = probe_node["module"].as<std::string>();
+            layer.pattern = pattern_of(probe_node);
+            layer.is_regex = static_cast<bool>(probe_node["regex"]);
+            layer.aggregate = probe_node["aggregate"] ? probe_node["aggregate"].as<bool>() : false;
+            layer.off = probe_node["off"] ? probe_node["off"].as<bool>() : false;
+            if (!probe_node["name"]) {
+              throw std::invalid_argument("name is required for a client module layer.");
+            }
+            layer.name = probe_node["name"].as<std::string>();
+            this->client_layers.push_back(std::move(layer));
+            continue;
+          }
           if (probe_node["type"]) {
             CaptureType type;
             convert(probe_node["type"].as<std::string>(), type);
@@ -456,7 +457,8 @@ ConfigurationManager::ConfigurationManager(int argc, char** argv, bool load_capt
                 probe_node["hot_exclude_glob"]
                     ? datacrumbs::utils::glob_to_regex(
                           probe_node["hot_exclude_glob"].as<std::string>())
-                    : (probe_node["hot_exclude"] ? probe_node["hot_exclude"].as<std::string>() : "");
+                    : (probe_node["hot_exclude"] ? probe_node["hot_exclude"].as<std::string>()
+                                                 : "");
             if (probe_node["hot_sensitive"])
               for (const auto& s : probe_node["hot_sensitive"])
                 probe->hot_sensitive.push_back(s.as<std::string>());
@@ -551,9 +553,9 @@ ConfigurationManager::ConfigurationManager(const std::filesystem::path& runtime_
       trace_log_dir(DATACRUMBS_LOG_DIR),
       capture_probes(),
       runtime_probes(),
-      user(env_or_default("DATACRUMBS_USER", env_or_default("USER", DATACRUMBS_INSTALL_USER))),
+      user(env_or_default(DATACRUMBS_ENV_USER, env_or_default("USER", DATACRUMBS_INSTALL_USER))),
       log_dir(DATACRUMBS_LOG_DIR),
-      run_id(env_or_default("DATACRUMBS_SERVER_RUN_ID", runtime_timestamp())),
+      run_id(env_or_default(DATACRUMBS_ENV_SERVER_RUN_ID, runtime_timestamp())),
       disable_mpi(true) {
   probe_file_path = absolute_normalized_path(runtime_probe_file);
   system_probe_path = DATACRUMBS_SYSTEM_PROBE_FILE;
@@ -736,31 +738,6 @@ void ConfigurationManager::load_category_map() {
     }
   }
   json_object_put(root);
-}
-
-void ConfigurationManager::load_runtime_system_configuration() {
-  if (std::getenv("DATACRUMBS_USER") != nullptr) {
-    user = std::getenv("DATACRUMBS_USER");
-  }
-  if (std::getenv("DATACRUMBS_LOG_DIR") != nullptr) {
-    log_dir = std::getenv("DATACRUMBS_LOG_DIR");
-  }
-  if (std::getenv("DATACRUMBS_INSTALL_DATA_DIR") != nullptr) {
-    data_dir = std::getenv("DATACRUMBS_INSTALL_DATA_DIR");
-  }
-  if (std::getenv("DATACRUMBS_CONFIGURED_TRACE_DIR") != nullptr) {
-    trace_log_dir = std::getenv("DATACRUMBS_CONFIGURED_TRACE_DIR");
-  }
-
-  if (trace_log_dir.empty()) {
-    trace_log_dir = DATACRUMBS_CONFIGURED_TRACE_DIR;
-  }
-  if (log_dir.empty()) {
-    log_dir = DATACRUMBS_LOG_DIR;
-  }
-  if (data_dir.empty()) {
-    data_dir = DATACRUMBS_INSTALL_DATA_DIR;
-  }
 }
 
 void ConfigurationManager::load_runtime_probe_file() {

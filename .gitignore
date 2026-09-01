@@ -42,3 +42,5 @@
 .nfs*
 build*
 *__pycache__*
+# generated at build time from the headers this build compiles against
+src/datacrumbs/utils/client/api_wrap_list.h

@@ -21,4 +21,12 @@
 #define DATACRUMBS_UTILS_INSTALL_DATA_DIR "@DATACRUMBS_UTILS_INSTALL_DATA_DIR@"
 #define DATACRUMBS_UTILS_INSTALL_MODULES_DIR "@DATACRUMBS_UTILS_INSTALL_MODULES_DIR@"
 
+
+// Client modules this build contains. The client is one library with one entry point, so the
+// constructor has to know which modules exist rather than which shared objects a user preloaded.
+#cmakedefine01 DATACRUMBS_UTILS_HAVE_DOCA
+#cmakedefine01 DATACRUMBS_UTILS_HAVE_IBVERBS
+#cmakedefine01 DATACRUMBS_UTILS_HAVE_API_WRAP
+
+
 #endif  // DATACRUMBS_UTILS_CONFIG_HPP

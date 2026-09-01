@@ -97,7 +97,7 @@ def render_template(template_path: Path, output_path: Path,
         )
 
     # Detect file paths that collapsed to a bare root prefix because a path
-    # variable was empty (e.g. "" + "/include/..." → "/include/...").
+    # variable was empty (e.g. "" + "/include/..." -> "/include/...").
     bad_file_paths = re.findall(r"(?m)^\s*file:\s*(/(?:include|usr/include)/\S+)", expanded)
     if bad_file_paths:
         raise ValueError(

@@ -1,6 +1,11 @@
 cmake_minimum_required(VERSION 3.20)
 cmake_policy(SET CMP0075 NEW)
 project(datacrumbs-utils LANGUAGES C CXX)
+
+# Warnings on. A stray vararg left after removing a field from a record made snprintf read an
+# integer as a char* and corrupt the traced process; -Wformat would have caught it at compile time.
+add_compile_options(-Wall -Wextra -Wformat=2)
+
 include(CTest)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -32,6 +37,26 @@ find_package(Python3 COMPONENTS Interpreter REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(ZLIB REQUIRED)
 find_package(yaml-cpp REQUIRED)
+
+# GOTCHA rewrites the GOT rather than relying on symbol resolution order, which is what lets it
+# reach calls made by a dlopened plugin into its own dependency. LD_PRELOAD with dlsym(RTLD_NEXT)
+# cannot: measured against doca_bench, which dlopens its engine libraries, interposition saw zero
+# typed task allocations where GOTCHA saw them all.
+#
+# Optional so a build without it still produces the eBPF and writer side. Install it into the same
+# prefix as the other out-of-tree dependencies and it is found automatically.
+option(DATACRUMBS_UTILS_ENABLE_GOTCHA "Wrap library calls with GOTCHA" ON)
+if(DATACRUMBS_UTILS_ENABLE_GOTCHA)
+  find_package(gotcha CONFIG QUIET)
+  if(gotcha_FOUND)
+    message(STATUS "GOTCHA found, library-call wrapping enabled")
+  else()
+    message(STATUS "GOTCHA not found, falling back to dlsym interposition; "
+                   "calls from dlopened plugins will not be traced")
+    set(DATACRUMBS_UTILS_ENABLE_GOTCHA OFF)
+  endif()
+endif()
+
 set(DATACRUMBS_UTILS_PYTHON_EXECUTABLE "${Python3_EXECUTABLE}")
 
 set(_DATACRUMBS_EXPORTED_KEYS
@@ -54,6 +79,8 @@ set(_DATACRUMBS_EXPORTED_KEYS
     MAX_RUNTIME_FUNCTIONS
     SKIP_SMALL_EVENTS_THRESHOLD_NS
     TIME_INTERVAL_NS
+    TIME_UNIT
+    TIME_DIVISOR_NS
     KERNEL_UNAME_R
     KERNEL_HEADERS_PATH
     LIBC_SO
@@ -151,6 +178,15 @@ datacrumbs_set_default(DATACRUMBS_TRACE_RINGBUF_SIZE_MB "16")
 datacrumbs_set_default(DATACRUMBS_MAX_RUNTIME_FUNCTIONS "16384")
 datacrumbs_set_default(DATACRUMBS_SKIP_SMALL_EVENTS_THRESHOLD_NS "1000")
 datacrumbs_set_default(DATACRUMBS_TIME_INTERVAL_NS "1000000")
+# Mirrors the core build: the unit of ts and dur, declared in every trace's time_metric record.
+datacrumbs_set_default(DATACRUMBS_TIME_UNIT "NS")
+if(DATACRUMBS_TIME_UNIT STREQUAL "NS")
+  datacrumbs_set_default(DATACRUMBS_TIME_DIVISOR_NS "1")
+elseif(DATACRUMBS_TIME_UNIT STREQUAL "US")
+  datacrumbs_set_default(DATACRUMBS_TIME_DIVISOR_NS "1000")
+else()
+  message(FATAL_ERROR "DATACRUMBS_TIME_UNIT must be NS or US, got '${DATACRUMBS_TIME_UNIT}'")
+endif()
 datacrumbs_set_default(DATACRUMBS_SCHEDULER_TYPE "FLUX")
 datacrumbs_set_default(DATACRUMBS_SCHEDULER_JOBID_ENV_VAR "NONE")
 datacrumbs_set_default(DATACRUMBS_LOG_LEVEL_STR "INFO")
@@ -283,6 +319,27 @@ set(DATACRUMBS_UTILS_MOVED_HEADERS
 foreach(header IN LISTS DATACRUMBS_UTILS_MOVED_HEADERS)
   stage_datacrumbs_header("${CMAKE_CURRENT_SOURCE_DIR}/src/${header}" "${header}")
 endforeach()
+# Client modules this build contains. Decided before the generated config header is written, since
+# the one client constructor compiles its calls against these.
+datacrumbs_set_default(DATACRUMBS_LIBCLANG "/usr/lib/x86_64-linux-gnu/libclang-14.so.1")
+option(DATACRUMBS_UTILS_HAVE_IBVERBS "Build the ibverbs client module into the client" ON)
+option(DATACRUMBS_UTILS_HAVE_DOCA "Build the DOCA client module into the client" ON)
+# Needs libclang to generate the wrap list. Still an option: a build that has libclang may not want
+# 2094 symbols wrapped.
+if(EXISTS "${DATACRUMBS_LIBCLANG}" AND EXISTS "${DATACRUMBS_PYLIB}/clang/cindex.py")
+  set(_dc_api_wrap_default ON)
+else()
+  set(_dc_api_wrap_default OFF)
+endif()
+option(DATACRUMBS_UTILS_HAVE_API_WRAP "Build the wrapped API surface into the client"
+       ${_dc_api_wrap_default})
+if(DATACRUMBS_UTILS_HAVE_API_WRAP AND NOT _dc_api_wrap_default)
+  message(FATAL_ERROR "DATACRUMBS_UTILS_HAVE_API_WRAP needs libclang and its python bindings; "
+                      "looked for ${DATACRUMBS_LIBCLANG} and ${DATACRUMBS_PYLIB}/clang/cindex.py")
+endif()
+message(STATUS "             - client modules: ibverbs=${DATACRUMBS_UTILS_HAVE_IBVERBS} "
+               "doca=${DATACRUMBS_UTILS_HAVE_DOCA} api=${DATACRUMBS_UTILS_HAVE_API_WRAP}")
+
 configure_file(
   "${CMAKE_CURRENT_SOURCE_DIR}/cmake/configure_files/datacrumbs_utils_config.h.in"
   "${DATACRUMBS_UTILS_GENERATED_CONFIG_HEADER}"
@@ -333,8 +390,22 @@ install(
   FILES "${DATACRUMBS_UTILS_BUILD_MODULEFILE}"
   DESTINATION "${DATACRUMBS_INSTALL_ETC_MODULESDIR}/${DATACRUMBS_UTILS_MODULE_NAME}"
 )
+# Shipped for DPA kernels to include: the device side of the join capture is compiled into the
+# application by dpacc, not into any library here.
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/include/datacrumbs/utils/dpa/dc_dpa_trace.h"
+        DESTINATION "${DATACRUMBS_INSTALL_INCLUDE_DIR}/datacrumbs/utils/dpa")
 install(FILES "${DATACRUMBS_UTILS_GENERATED_CONFIG_HEADER}"
         DESTINATION "${DATACRUMBS_INSTALL_INCLUDE_DIR}/datacrumbs")
+
+# Split out so the preloaded client links environment reading without the yaml, json and filesystem
+# work the rest of the manager does.
+set(DATACRUMBS_UTILS_RUNTIME_CONFIG_SRC
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/utils/common/runtime_configuration.cpp")
+
+# Anything that writes a trace needs this: the sink maps the timesync snapshot, and the path comes
+# from the configuration rather than from getenv at the point of use.
+add_library(datacrumbs_runtime_config OBJECT ${DATACRUMBS_UTILS_RUNTIME_CONFIG_SRC})
+set_property(TARGET datacrumbs_runtime_config PROPERTY POSITION_INDEPENDENT_CODE ON)
 
 set(DATACRUMBS_UTILS_COMMON_SRC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/utils/common/configuration_manager.cpp"
@@ -343,10 +414,14 @@ set(DATACRUMBS_UTILS_COMMON_SRC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/utils/common/probe_signing_service.h"
 )
 
+# One client library, not one per module: with seven preloadable objects the init order came from
+# how a user spelled LD_PRELOAD, and that order is load bearing. Two of them wrapping one symbol by
+# different mechanisms segfaulted, and each opened its own sink.
 set(DATACRUMBS_UTILS_CLIENT_SRC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/utils/client/library.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/utils/client/library.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/utils/client/pfw_sink.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/utils/common/clock.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/utils/common/pfw_sink.h"
 )
 add_library(datacrumbs_client SHARED ${DATACRUMBS_UTILS_CLIENT_SRC})
 set_target_properties(
@@ -355,8 +430,9 @@ set_target_properties(
     OUTPUT_NAME datacrumbs_client
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}"
 )
-target_link_libraries(datacrumbs_client ${DATACRUMBS_PUBLIC_COMMON_LIBRARY} OpenSSL::Crypto
-                      ZLIB::ZLIB)
+target_link_libraries(datacrumbs_client PRIVATE datacrumbs_runtime_config
+                      ${DATACRUMBS_PUBLIC_COMMON_LIBRARY} OpenSSL::Crypto
+                      ZLIB::ZLIB ${CMAKE_DL_LIBS})
 install(TARGETS datacrumbs_client LIBRARY DESTINATION "${DATACRUMBS_INSTALL_LIB_DIR}")
 
 add_custom_target(
@@ -374,12 +450,11 @@ set(DATACRUMBS_UTILS_PROBE_CONFIGURATOR_SRC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/utils/explorer/mechanism/header_capture.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/utils/explorer/mechanism/header_capture.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/utils/explorer/mechanism/ksym_capture.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/utils/explorer/mechanism/ksym_capture.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/utils/explorer/mechanism/usdt_functions.h"
 )
 add_executable(datacrumbs_probe_configurator ${DATACRUMBS_UTILS_PROBE_CONFIGURATOR_SRC} ${DATACRUMBS_UTILS_COMMON_SRC})
 set_target_properties(datacrumbs_probe_configurator PROPERTIES OUTPUT_NAME datacrumbs_probe_configurator_exec)
-target_link_libraries(datacrumbs_probe_configurator ${DATACRUMBS_PUBLIC_COMMON_LIBRARY} ${DEPENDENCY_LIB} yaml-cpp OpenSSL::Crypto)
+target_link_libraries(datacrumbs_probe_configurator datacrumbs_runtime_config ${DATACRUMBS_PUBLIC_COMMON_LIBRARY} ${DEPENDENCY_LIB} yaml-cpp OpenSSL::Crypto)
 add_dependencies(datacrumbs_probe_configurator datacrumbs_client clean_all)
 install(TARGETS datacrumbs_probe_configurator RUNTIME DESTINATION "${DATACRUMBS_INSTALL_BINARYDIR}")
 
@@ -393,7 +468,11 @@ install(TARGETS dc_timesync RUNTIME DESTINATION "${DATACRUMBS_INSTALL_BINARYDIR}
 # axis the dc_timesync daemon publishes. A MODULE (load-only, no link-time consumers).
 add_library(datacrumbs_plugin_timesync MODULE
     "${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/utils/plugins/timesync/timesync_remap.cpp")
-target_link_libraries(datacrumbs_plugin_timesync ${DATACRUMBS_PUBLIC_COMMON_LIBRARY})
+# Every plugin reading ConfigurationManager::runtime() must link datacrumbs_runtime_config. The
+# server dlopens plugins and does not export that symbol, so omitting it fails the load with one
+# ERROR line while the server carries on and writes a trace that looks complete.
+target_link_libraries(datacrumbs_plugin_timesync datacrumbs_runtime_config
+                      ${DATACRUMBS_PUBLIC_COMMON_LIBRARY})
 install(TARGETS datacrumbs_plugin_timesync
         LIBRARY DESTINATION "${DATACRUMBS_UTILS_INSTALL_LIB_DIR}/datacrumbs/plugins")
 
@@ -401,33 +480,54 @@ install(TARGETS datacrumbs_plugin_timesync
 # BPF captures. Core does the capture-time read; this plugin owns the counter policy.
 add_library(datacrumbs_plugin_pmu MODULE
     "${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/utils/plugins/pmu/pmu_plugin.cpp")
-target_link_libraries(datacrumbs_plugin_pmu ${DATACRUMBS_PUBLIC_COMMON_LIBRARY})
+target_link_libraries(datacrumbs_plugin_pmu datacrumbs_runtime_config
+                      ${DATACRUMBS_PUBLIC_COMMON_LIBRARY})
 install(TARGETS datacrumbs_plugin_pmu
         LIBRARY DESTINATION "${DATACRUMBS_UTILS_INSTALL_LIB_DIR}/datacrumbs/plugins")
 
+
+
 # interposition client: LD_PRELOAD lib that traces libc I/O in userspace (no uprobe/server) and
 # writes its own global-epoch .pfw, merged with the server trace at collect.
-add_library(datacrumbs_interpose SHARED
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/utils/client/interpose.cpp")
-target_link_libraries(datacrumbs_interpose ${DATACRUMBS_PUBLIC_COMMON_LIBRARY} OpenSSL::Crypto
+add_library(datacrumbs_mod_stdio OBJECT
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/utils/client/stdio/library.cpp")
+target_link_libraries(datacrumbs_mod_stdio PRIVATE ${DATACRUMBS_PUBLIC_COMMON_LIBRARY} gotcha)
+set_property(TARGET datacrumbs_mod_stdio PROPERTY POSITION_INDEPENDENT_CODE ON)
+target_link_libraries(datacrumbs_client PRIVATE datacrumbs_mod_stdio)
+
+add_library(datacrumbs_mod_posix OBJECT
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/utils/client/dpa/library.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/utils/client/posix/library.cpp")
+target_link_libraries(datacrumbs_mod_posix PRIVATE ${DATACRUMBS_PUBLIC_COMMON_LIBRARY} gotcha)
+set_property(TARGET datacrumbs_mod_posix PROPERTY POSITION_INDEPENDENT_CODE ON)
+target_link_libraries(datacrumbs_client PRIVATE datacrumbs_mod_posix)
+
+# Window boundaries written through the same sink as every other client record, so a harness never
+# has to reproduce the timesync mapping to say when a configuration ran.
+add_executable(datacrumbs_window_mark
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/utils/client/window_mark.cpp")
+target_link_libraries(datacrumbs_window_mark datacrumbs_runtime_config ${DATACRUMBS_PUBLIC_COMMON_LIBRARY} OpenSSL::Crypto
                       ZLIB::ZLIB ${CMAKE_DL_LIBS})
-install(TARGETS datacrumbs_interpose LIBRARY DESTINATION "${DATACRUMBS_UTILS_INSTALL_LIB_DIR}")
+install(TARGETS datacrumbs_window_mark RUNTIME DESTINATION "${DATACRUMBS_UTILS_INSTALL_BIN_DIR}")
 
 # dftracer clock shim: LD_PRELOAD with dftracer (unmodified) so its gettimeofday timestamps become
 # the dc_timesync global epoch. Reuses the shared timesync reader.
-add_library(datacrumbs_dftracer_clock SHARED
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/utils/client/dftracer_clock.cpp")
-target_link_libraries(datacrumbs_dftracer_clock ${DATACRUMBS_PUBLIC_COMMON_LIBRARY} ${CMAKE_DL_LIBS})
-install(TARGETS datacrumbs_dftracer_clock LIBRARY DESTINATION "${DATACRUMBS_UTILS_INSTALL_LIB_DIR}")
+add_library(datacrumbs_mod_clock OBJECT
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/utils/client/clock/library.cpp")
+target_link_libraries(datacrumbs_mod_clock PRIVATE ${DATACRUMBS_PUBLIC_COMMON_LIBRARY} gotcha)
+set_property(TARGET datacrumbs_mod_clock PROPERTY POSITION_INDEPENDENT_CODE ON)
+target_link_libraries(datacrumbs_client PRIVATE datacrumbs_mod_clock)
 
 # RDMA hw-timestamp capture: LD_PRELOAD upgrades ibv_create_cq CQs to timestamped extended CQs and
 # emits per-completion NIC hw timestamps on the global epoch. Uses dlvsym for verbs symbols (no
 # -libverbs link); needs infiniband/verbs.h in the sysroot. Enable at runtime with DC_HWTS=1.
-add_library(datacrumbs_rdma_hwts SHARED
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/utils/client/rdma_hwts.cpp")
-target_link_libraries(datacrumbs_rdma_hwts ${DATACRUMBS_PUBLIC_COMMON_LIBRARY} OpenSSL::Crypto
-                      ZLIB::ZLIB ${CMAKE_DL_LIBS})
-install(TARGETS datacrumbs_rdma_hwts LIBRARY DESTINATION "${DATACRUMBS_UTILS_INSTALL_LIB_DIR}")
+if(DATACRUMBS_UTILS_HAVE_IBVERBS)
+  add_library(datacrumbs_mod_ibverbs OBJECT
+      "${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/utils/client/ibverbs/library.cpp")
+  target_link_libraries(datacrumbs_mod_ibverbs PRIVATE ${DATACRUMBS_PUBLIC_COMMON_LIBRARY})
+  set_property(TARGET datacrumbs_mod_ibverbs PROPERTY POSITION_INDEPENDENT_CODE ON)
+  target_link_libraries(datacrumbs_client PRIVATE datacrumbs_mod_ibverbs)
+endif()
 
 # DOCA-native variant: same source with the DATACRUMBS_DOCA_HWTS block (frida-gum inline hook on the
 # DOCA CQ poll to capture the kernel-bypass fabric wire). Built only when the frida-gum devkit is
@@ -436,7 +536,7 @@ datacrumbs_set_default(FRIDA_GUM_DIR
     "/home/sinurat1/projects/dpu-explainability/deps/src/bpftime/build-arm64/FridaGum-prefix/src/FridaGum")
 if(EXISTS "${FRIDA_GUM_DIR}/libfrida-gum.a")
   add_library(datacrumbs_rdma_hwts_doca SHARED
-      "${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/utils/client/rdma_hwts.cpp")
+      "${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/utils/client/ibverbs/library.cpp")
   target_compile_definitions(datacrumbs_rdma_hwts_doca PRIVATE DATACRUMBS_DOCA_HWTS)
   target_include_directories(datacrumbs_rdma_hwts_doca PRIVATE "${FRIDA_GUM_DIR}")
   target_link_libraries(datacrumbs_rdma_hwts_doca ${DATACRUMBS_PUBLIC_COMMON_LIBRARY} OpenSSL::Crypto
@@ -446,6 +546,239 @@ else()
   message(STATUS "frida-gum devkit not at ${FRIDA_GUM_DIR}; skipping datacrumbs_rdma_hwts_doca")
 endif()
 
+
+# Fixed-engine hw timestamps: LD_PRELOAD reads the mlx5 CQEs the DOCA engines complete on. Those CQs
+# are built through mlx5dv_devx_obj_create, not ibv_create_cq, so the ibverbs shim above cannot see
+# them. Enable at runtime with DC_ENGINE_HWTS=1.
+if(DATACRUMBS_UTILS_HAVE_DOCA)
+  add_library(datacrumbs_mod_doca OBJECT
+      "${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/utils/client/doca/library.cpp")
+  target_link_libraries(datacrumbs_mod_doca PRIVATE ${DATACRUMBS_PUBLIC_COMMON_LIBRARY} gotcha)
+  set_property(TARGET datacrumbs_mod_doca PROPERTY POSITION_INDEPENDENT_CODE ON)
+  target_link_libraries(datacrumbs_client PRIVATE datacrumbs_mod_doca)
+endif()
+
+# Classified API surface, wrapped with GOTCHA. The wrap list is generated from the headers by
+# reverse-eng/inventory/gen_gotcha.py and filtered through the symbol classification, so what gets
+# wrapped follows the inventory rather than what was convenient to hand-write. GOTCHA rather than
+# uprobes because a uprobe traps inside the function and on BlueField that breaks libmlx5's
+# write-combining doorbell burst. Enable at runtime with DC_API_TRACE=1.
+if(DATACRUMBS_UTILS_ENABLE_GOTCHA)
+  # The wrap list is generated at build time from the headers this build actually compiles against.
+  # A checked-in list drifts: the same libclang run over a different machine's rdma-core produced a
+  # different set, so a stale list would emit prototypes that do not match the target.
+  #
+  # Needs libclang plus its python bindings. DATACRUMBS_LIBCLANG and DATACRUMBS_PYLIB point at them;
+  # both come from the out-of-tree deps prefix, since the build node has no network to install them.
+  datacrumbs_set_default(DATACRUMBS_LIBCLANG "/usr/lib/x86_64-linux-gnu/libclang-14.so.1")
+  datacrumbs_set_default(DATACRUMBS_PYLIB
+      "/home/sinurat1/projects/dpu-explainability/deps/pylib")
+  # The rdma-core headers this build compiles against. Not in the cross sysroot - they are
+  # arch-independent, so the cross build uses the build machine's copy, and the wrap list must be
+  # generated from that same copy or the prototypes will not match.
+  datacrumbs_set_default(DATACRUMBS_IBVERBS_INCLUDE "/usr/include")
+  # The device op tables live in the kernel's mlx5 headers, which no userspace build can compile;
+  # the generator reads them as text, since a table of names and numbers needs no parser. The OFED
+  # driver source is preferred over a distribution kernel: it is the provider these traces come from,
+  # and it carries opcodes a stock header can lack. Verified equal on every shared opcode.
+  if(NOT DATACRUMBS_MLX5_KERNEL_INCLUDE)
+    file(GLOB _dc_ofed_mlx5 "/usr/src/mlnx-ofed-kernel-*/include/linux/mlx5")
+    list(SORT _dc_ofed_mlx5)
+    list(REVERSE _dc_ofed_mlx5)
+    foreach(_dc_cand IN LISTS _dc_ofed_mlx5)
+      if(EXISTS "${_dc_cand}/device.h")
+        set(DATACRUMBS_MLX5_KERNEL_INCLUDE "${_dc_cand}")
+        break()
+      endif()
+    endforeach()
+  endif()
+  datacrumbs_set_default(DATACRUMBS_MLX5_KERNEL_INCLUDE
+      "/usr/src/linux-bluefield-headers-5.15.0-1065/include/linux/mlx5")
+  # DOCA headers come from the target, not the build machine: the host install is a subset (27 of
+  # 93). The DPA device headers are excluded by the generator, which cannot parse __dpa_global__ and
+  # would gain nothing anyway - that code runs on the DPA cores, where there is no GOT to rewrite.
+  datacrumbs_set_default(DATACRUMBS_DOCA_INCLUDE
+      "/home/sinurat1/projects/dpu-explainability/cross/deps/doca/include")
+  set(_dc_wrap_hdrs "${DATACRUMBS_IBVERBS_INCLUDE}/infiniband/verbs.h"
+                    "${DATACRUMBS_IBVERBS_INCLUDE}/infiniband/mlx5dv.h")
+  if(EXISTS "${DATACRUMBS_DOCA_INCLUDE}")
+    file(GLOB _dc_doca_hdrs "${DATACRUMBS_DOCA_INCLUDE}/doca_*.h")
+    list(FILTER _dc_doca_hdrs EXCLUDE REGEX "doca_dpa_dev")
+    list(APPEND _dc_wrap_hdrs ${_dc_doca_hdrs})
+  endif()
+  # FlexIO ships outside the DOCA include tree, so globbing DOCA alone leaves its 159 host symbols
+  # inventoried and unwrapped. Only the host side: libflexio-dev runs on the DPA cores, where there
+  # is no GOT to rewrite and the headers do not parse for a host target.
+  datacrumbs_set_default(DATACRUMBS_FLEXIO_INCLUDE
+      "/home/sinurat1/projects/dpu-explainability/cross/deps/flexio/include")
+  if(EXISTS "${DATACRUMBS_FLEXIO_INCLUDE}/libflexio/flexio.h")
+    list(APPEND _dc_wrap_hdrs "${DATACRUMBS_FLEXIO_INCLUDE}/libflexio/flexio.h")
+  endif()
+  # PKA is a second crypto engine, reached through its own library rather than DOCA, so nothing in
+  # the DOCA or FlexIO trees declares it.
+  datacrumbs_set_default(DATACRUMBS_PKA_INCLUDE
+      "/home/sinurat1/projects/dpu-explainability/cross/deps/pka/include")
+  if(EXISTS "${DATACRUMBS_PKA_INCLUDE}/pka.h")
+    file(GLOB _dc_pka_hdrs "${DATACRUMBS_PKA_INCLUDE}/pka*.h")
+    list(APPEND _dc_wrap_hdrs ${_dc_pka_hdrs})
+  endif()
+# dpa telemetry plugin: samples the DPA cores' own per-thread counters, which no host-side shim can
+# see. The library path is derived from the header path so the plugin follows whichever DOCA the
+# wrap list was generated against.
+get_filename_component(DATACRUMBS_DOCA_ROOT "${DATACRUMBS_DOCA_INCLUDE}" DIRECTORY)
+datacrumbs_set_default(DATACRUMBS_DOCA_LIB "${DATACRUMBS_DOCA_ROOT}/lib/aarch64-linux-gnu")
+# The header alone is not enough: it sits in cross deps both targets share, so a host build found it
+# and failed on an incompatible -ldoca_common. DPA cores are BlueField silicon, so aarch64 only.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$"
+   AND EXISTS "${DATACRUMBS_DOCA_INCLUDE}/doca_telemetry_dpa.h"
+   AND EXISTS "${DATACRUMBS_DOCA_LIB}")
+  add_library(datacrumbs_plugin_dpa_telemetry MODULE
+      "${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/utils/plugins/dpa_telemetry/dpa_telemetry.cpp")
+  target_include_directories(datacrumbs_plugin_dpa_telemetry PRIVATE "${DATACRUMBS_DOCA_INCLUDE}")
+  # Every doca_telemetry_dpa_* symbol is DOCA_EXPERIMENTAL with no stable alternative;
+  # this is DOCA's own opt-in for that, not a warning silencer.
+  target_compile_definitions(datacrumbs_plugin_dpa_telemetry PRIVATE DOCA_ALLOW_EXPERIMENTAL_API)
+  target_link_libraries(datacrumbs_plugin_dpa_telemetry datacrumbs_runtime_config
+                        ${DATACRUMBS_PUBLIC_COMMON_LIBRARY} doca_telemetry doca_common)
+  target_link_directories(datacrumbs_plugin_dpa_telemetry PRIVATE "${DATACRUMBS_DOCA_LIB}")
+  install(TARGETS datacrumbs_plugin_dpa_telemetry
+          LIBRARY DESTINATION "${DATACRUMBS_UTILS_INSTALL_LIB_DIR}/datacrumbs/plugins")
+else()
+  message(STATUS "not an aarch64 target with DOCA libraries; skipping the DPA telemetry plugin")
+endif()
+
+# doca diag plugin: samples the device's own diagnostic counters (physical port, PCIe link bytes and
+# latency, internal cache, completion engine CQEs). Same aarch64 + DOCA gate as the DPA plugin.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$"
+   AND EXISTS "${DATACRUMBS_DOCA_INCLUDE}/doca_telemetry_diag.h"
+   AND EXISTS "${DATACRUMBS_DOCA_LIB}")
+  add_library(datacrumbs_plugin_doca_diag MODULE
+      "${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/utils/plugins/doca_diag/doca_diag.cpp")
+  target_include_directories(datacrumbs_plugin_doca_diag PRIVATE "${DATACRUMBS_DOCA_INCLUDE}")
+  target_compile_definitions(datacrumbs_plugin_doca_diag PRIVATE DOCA_ALLOW_EXPERIMENTAL_API)
+  target_link_libraries(datacrumbs_plugin_doca_diag datacrumbs_runtime_config
+                        ${DATACRUMBS_PUBLIC_COMMON_LIBRARY} doca_telemetry doca_common)
+  target_link_directories(datacrumbs_plugin_doca_diag PRIVATE "${DATACRUMBS_DOCA_LIB}")
+  install(TARGETS datacrumbs_plugin_doca_diag
+          LIBRARY DESTINATION "${DATACRUMBS_UTILS_INSTALL_LIB_DIR}/datacrumbs/plugins")
+else()
+  message(STATUS "not an aarch64 target with DOCA libraries; skipping the DOCA diag plugin")
+endif()
+
+  set(_dc_wrap_out "${CMAKE_CURRENT_BINARY_DIR}/generated/datacrumbs/utils/client/api_wrap_list.h")
+  set(_dc_wrap_split_dir "${CMAKE_CURRENT_BINARY_DIR}/generated/datacrumbs/utils/client")
+  set(_dc_wrap_split)
+  foreach(_lib doca ibverbs mlx5 flexio pka other)
+    list(APPEND _dc_wrap_split "${_dc_wrap_split_dir}/${_lib}/api.h")
+  endforeach()
+  list(APPEND _dc_wrap_split "${_dc_wrap_split_dir}/api_decoders.h")
+  set(_dc_ops_out "${CMAKE_CURRENT_BINARY_DIR}/generated/datacrumbs/utils/client/mlx5_ops.h")
+  set(_dc_tramp_out "${CMAKE_CURRENT_BINARY_DIR}/generated/datacrumbs/utils/client/api_tramp_list.h")
+  set(_dc_undecl_out
+      "${CMAKE_CURRENT_BINARY_DIR}/generated/datacrumbs/utils/client/api_undeclared_list.h")
+  set(_dc_devx_h "${DATACRUMBS_MLX5_KERNEL_INCLUDE}/mlx5_ifc.h")
+  set(_dc_wqe_h "${DATACRUMBS_MLX5_KERNEL_INCLUDE}/device.h")
+
+  # Outside the libclang guard on purpose: rdma_hwts includes this table unconditionally, and
+  # extracting constants is text work, so tying it to the wrap list would break the shim on a build
+  # machine that merely lacks the python bindings.
+  if(NOT EXISTS "${_dc_wqe_h}")
+    message(FATAL_ERROR
+        "mlx5 kernel headers not found at ${DATACRUMBS_MLX5_KERNEL_INCLUDE}. "
+        "Set DATACRUMBS_MLX5_KERNEL_INCLUDE to a directory holding device.h and mlx5_ifc.h.")
+  endif()
+  add_custom_command(
+    OUTPUT "${_dc_ops_out}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+            "${CMAKE_CURRENT_BINARY_DIR}/generated/datacrumbs/utils/client"
+    COMMAND "${DATACRUMBS_UTILS_PYTHON_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/scripts/datacrumbs/gen_gotcha.py" --only-decoders
+            --decode-constants "MLX5_CMD_OP=${_dc_devx_h}"
+            --decode-constants "MLX5_OPCODE=${_dc_wqe_h}"
+            --output "${_dc_ops_out}"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/scripts/datacrumbs/gen_gotcha.py" "${_dc_devx_h}"
+            "${_dc_wqe_h}"
+    COMMENT "Generating mlx5 device op tables from ${DATACRUMBS_MLX5_KERNEL_INCLUDE}"
+    VERBATIM)
+  add_custom_target(datacrumbs_mlx5_ops DEPENDS "${_dc_ops_out}")
+  if(TARGET datacrumbs_mod_ibverbs)
+    add_dependencies(datacrumbs_mod_ibverbs datacrumbs_mlx5_ops)
+    target_include_directories(datacrumbs_mod_ibverbs
+        PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
+  endif()
+  if(TARGET datacrumbs_rdma_hwts_doca)
+    add_dependencies(datacrumbs_rdma_hwts_doca datacrumbs_mlx5_ops)
+    target_include_directories(datacrumbs_rdma_hwts_doca
+        PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
+  endif()
+
+  if(EXISTS "${DATACRUMBS_LIBCLANG}" AND EXISTS "${DATACRUMBS_PYLIB}/clang/cindex.py")
+    add_custom_command(
+      OUTPUT "${_dc_wrap_out}" "${_dc_tramp_out}" ${_dc_wrap_split}
+      COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated/datacrumbs/utils/client"
+      COMMAND ${CMAKE_COMMAND} -E env "PYTHONPATH=${DATACRUMBS_PYLIB}"
+              "${DATACRUMBS_UTILS_PYTHON_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/scripts/datacrumbs/gen_gotcha.py"
+              ${_dc_wrap_hdrs}
+              --libclang "${DATACRUMBS_LIBCLANG}"
+              --include "${DATACRUMBS_DOCA_INCLUDE}"
+              --include "${DATACRUMBS_FLEXIO_INCLUDE}"
+              --include "${DATACRUMBS_PKA_INCLUDE}"
+              --inventory "${CMAKE_CURRENT_SOURCE_DIR}/scripts/datacrumbs/api-inventory.tsv"
+              # Engine, DPA and FlexIO ops arrive inside a task or a struct rather than as a typed
+              # parameter, so decoding only parameter-carried enums names a fraction of them.
+              --decode-all-enums
+              # A DevX call names its command in the buffer, not in a parameter. Without this table
+              # the wrappers record the buffer as a pointer and no command is ever named.
+              --decode-constants "MLX5_CMD_OP=${_dc_devx_h}"
+              # Written by the same pass that skips them, so the trampoline list cannot drift from
+              # the symbols the wrap list dropped for being variadic.
+              --tramp-out "${_dc_tramp_out}"
+              # One list per library beside the combined one, so a translation unit that wraps DOCA
+              # includes doca/api.h and never carries the ibverbs surface.
+              --split-dir "${_dc_wrap_split_dir}"
+              --output "${_dc_wrap_out}"
+      DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/scripts/datacrumbs/gen_gotcha.py"
+              "${CMAKE_CURRENT_SOURCE_DIR}/scripts/datacrumbs/api-inventory.tsv"
+              ${_dc_wrap_hdrs}
+      COMMENT "Generating GOTCHA wrap list from the headers this build compiles against"
+      VERBATIM)
+    # Symbols the inventory classifies but no header declares: the private version nodes and the
+    # ibv_cmd kernel-command layer. A wrapper needs a prototype to forward arguments and a
+    # trampoline does not, so these are reachable as entry records even though the wrap list cannot
+    # carry them.
+    add_custom_command(
+      OUTPUT "${_dc_undecl_out}"
+      COMMAND "${DATACRUMBS_UTILS_PYTHON_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/scripts/datacrumbs/gen_tramp.py"
+              --inventory "${CMAKE_CURRENT_SOURCE_DIR}/scripts/datacrumbs/api-inventory.tsv"
+              --wrap-list "${_dc_wrap_out}"
+              --also-covered "${_dc_tramp_out}"
+              --output "${_dc_undecl_out}"
+      DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/scripts/datacrumbs/gen_tramp.py"
+              "${CMAKE_CURRENT_SOURCE_DIR}/scripts/datacrumbs/api-inventory.tsv"
+              "${_dc_wrap_out}" "${_dc_tramp_out}"
+      COMMENT "Generating trampoline list for symbols no header declares"
+      VERBATIM)
+
+    add_library(datacrumbs_api_trace SHARED
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/utils/client/wrap/library.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/datacrumbs/utils/client/wrap/api_tramp.cpp"
+        "${_dc_wrap_out}" "${_dc_tramp_out}" "${_dc_undecl_out}")
+    # No DOCA link dependency: the wrappers name DOCA types but reach the real functions through
+    # pointers GOTCHA fills in, so only the headers are needed.
+    target_include_directories(datacrumbs_api_trace
+        PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated" "${DATACRUMBS_DOCA_INCLUDE}"
+                "${DATACRUMBS_FLEXIO_INCLUDE}" "${DATACRUMBS_PKA_INCLUDE}")
+    target_link_libraries(datacrumbs_api_trace ${DATACRUMBS_PUBLIC_COMMON_LIBRARY} OpenSSL::Crypto
+                          ZLIB::ZLIB gotcha yaml-cpp ${CMAKE_DL_LIBS})
+    install(TARGETS datacrumbs_api_trace
+            LIBRARY DESTINATION "${DATACRUMBS_UTILS_INSTALL_LIB_DIR}")
+  else()
+    message(STATUS "libclang or its python bindings absent "
+                   "(${DATACRUMBS_LIBCLANG}, ${DATACRUMBS_PYLIB}); skipping datacrumbs_api_trace")
+  endif()
+endif()
 
 set(DATACRUMBS_UTILS_PROBE_CONFIGURATOR_BIN "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/datacrumbs_probe_configurator_exec")
 set(DATACRUMBS_UTILS_PROBE_CONFIGURATOR_INSTALL_BIN

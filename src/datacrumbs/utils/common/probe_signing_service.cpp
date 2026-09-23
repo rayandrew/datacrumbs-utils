@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: MIT
-// Owner: hariharandev1@llnl.gov
 
 #include <arpa/inet.h>
 #include <datacrumbs/datacrumbs_utils_config.h>
@@ -128,7 +127,6 @@ int tcp_port() {
 
 bool request_probe_signature(const std::string& signing_payload, std::string* checksum,
                              std::string* error) {
-  // Resolve manager endpoint from runtime configuration.
   const std::string host = tcp_host();
   const int port = tcp_port();
   const int client_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -139,7 +137,6 @@ bool request_probe_signature(const std::string& signing_payload, std::string* ch
     return false;
   }
 
-  // Resolve host to socket address before connect.
   addrinfo hints{};
   hints.ai_family = AF_INET;
   hints.ai_socktype = SOCK_STREAM;
@@ -166,7 +163,6 @@ bool request_probe_signature(const std::string& signing_payload, std::string* ch
     return false;
   }
 
-  // Send JSON-RPC signing request document.
   json_object* request_root = json_object_new_object();
   json_object* params = json_object_new_object();
   json_object_object_add(params, "signing_payload",
@@ -188,7 +184,6 @@ bool request_probe_signature(const std::string& signing_payload, std::string* ch
   }
   shutdown(client_fd, SHUT_WR);
 
-  // Read full response payload after half-close write side.
   std::string response_payload;
   const bool ok = read_all_from_fd(client_fd, &response_payload);
   close(client_fd);

@@ -1,27 +1,18 @@
 // SPDX-License-Identifier: MIT
-// Owner: hariharandev1@llnl.gov
 
 #ifndef DATACRUMBS_LIBRARY_H
 #define DATACRUMBS_LIBRARY_H
 
-/**
- * @brief Start datacrumbs client lifecycle from shared library context.
- */
+/// Emits the program's begin marker.
 extern "C" __attribute__((visibility("default"))) void datacrumbs_start();
 
-/**
- * @brief Stop datacrumbs client lifecycle from shared library context.
- */
+/// Emits the program's end marker. Idempotent.
 extern "C" __attribute__((visibility("default"))) void datacrumbs_stop();
 
-/**
- * @brief Constructor hook called when shared library is loaded.
- */
+/// Runs when this shared library loads.
 extern void __attribute__((constructor)) datacrumbs_init(void);
 
-/**
- * @brief Destructor hook called when shared library is unloaded.
- */
+/// Runs when this shared library unloads.
 extern void __attribute__((destructor)) datacrumbs_fini(void);
 
 #endif  // DATACRUMBS_LIBRARY_H

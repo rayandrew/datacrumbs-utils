@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: MIT
-// Owner: hariharandev1@llnl.gov
 
 #include <datacrumbs/utils/common/probe_signing_service.h>
 #include <datacrumbs/utils/explorer/probe_explorer.h>
@@ -20,6 +19,7 @@
 #include <sstream>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace {
 
@@ -34,40 +34,16 @@ std::string probe_signing_payload(json_object* summary, json_object* categories)
   return result;
 }
 
-const char* probe_type_to_string(datacrumbs::ProbeType type) {
-  switch (type) {
-    case datacrumbs::ProbeType::SYSCALLS:
-      return "syscalls";
-    case datacrumbs::ProbeType::KPROBE:
-      return "kprobe";
-    case datacrumbs::ProbeType::UPROBE:
-      return "uprobe";
-    case datacrumbs::ProbeType::USDT:
-      return "usdt";
-    case datacrumbs::ProbeType::CUSTOM:
-      return "custom";
+// The sampler's "functions" are perf event names, not symbols, so there is nothing to enumerate:
+// match the regex against the set the server can translate to a perf_event_attr.
+std::vector<std::string> perf_events_by_regex(const std::string& pattern) {
+  static const char* kSupported[] = {"cpu-clock", "task-clock", "cycles", "instructions"};
+  std::vector<std::string> result;
+  std::regex re(pattern);
+  for (const char* event : kSupported) {
+    if (std::regex_search(event, re)) result.push_back(event);
   }
-  return "unknown";
-}
-
-const char* capture_type_to_string(datacrumbs::CaptureType type) {
-  switch (type) {
-    case datacrumbs::CaptureType::HEADER:
-      return "header";
-    case datacrumbs::CaptureType::BINARY:
-      return "binary";
-    case datacrumbs::CaptureType::KSYM:
-      return "ksym";
-    case datacrumbs::CaptureType::USDT:
-      return "usdt";
-    case datacrumbs::CaptureType::CUSTOM:
-      return "custom";
-  }
-  return "unknown";
-}
-
-json_object* string_or_empty_json(const char* value) {
-  return json_object_new_string(value ? value : "");
+  return result;
 }
 
 std::string trim_copy(std::string value) {
@@ -167,10 +143,18 @@ std::string run_command(const std::string& command) {
 
 std::string extract_quoted_value(const std::string& line) {
   const auto first_quote = line.find('"');
-  if (first_quote == std::string::npos) return "";
-  const auto second_quote = line.find('"', first_quote + 1);
-  if (second_quote == std::string::npos) return "";
-  return line.substr(first_quote + 1, second_quote - first_quote - 1);
+  if (first_quote != std::string::npos) {
+    const auto second_quote = line.find('"', first_quote + 1);
+    if (second_quote != std::string::npos)
+      return line.substr(first_quote + 1, second_quote - first_quote - 1);
+  }
+  // readelf omits quotes (`DW_AT_name : name`, or `... (indirect string, offset: N): name`); take
+  // the value after the last ": " so both forms and the quoted (llvm-dwarfdump) form all work.
+  const auto sep = line.rfind(": ");
+  if (sep == std::string::npos) return "";
+  std::string v = line.substr(sep + 2);
+  while (!v.empty() && (v.back() == ' ' || v.back() == '\t' || v.back() == '\r')) v.pop_back();
+  return v;
 }
 
 std::string format_progress(size_t completed, size_t total) {
@@ -214,7 +198,7 @@ bool should_use_default_mpi_api_filter(const datacrumbs::CaptureProbe& capture_p
                                        const std::string& binary_path) {
   if (!is_openmpi_library(binary_path)) return false;
   const std::string regex = trim_copy(capture_probe.regex);
-  return regex.empty() || regex == ".*";
+  return regex.empty() || regex == ".*" || regex == "^.*$";  // "^.*$" is glob "*" translated
 }
 
 bool is_supported_runtime_probe_type(datacrumbs::ProbeType type) {
@@ -387,7 +371,9 @@ extract_dwarf_function_signatures(const std::string& elf_path,
     }
 
     if (current_function.level >= 0) {
-      if (line.find("DW_AT_name") != std::string::npos) {
+      // Only the first DW_AT_name (the subprogram's own, before any child DIE) is the function
+      // name; nested DW_TAG_variable/formal_parameter names must not overwrite it.
+      if (line.find("DW_AT_name") != std::string::npos && current_function.name.empty()) {
         current_function.name = extract_quoted_value(line);
         current_function_needed = !filter_to_target_names ||
                                   target_names.find(current_function.name) != target_names.end();
@@ -422,7 +408,8 @@ extract_source_backed_dwarf_function_signatures(const std::string& elf_path,
   const std::string output =
       run_command("llvm-dwarfdump --debug-info " + shell_escape(elf_path) + " 2>/dev/null");
   if (output.empty()) {
-    return signatures;
+    // If llvm-dwarfdump is not installed, fall back to the readelf-based extractor.
+    return extract_dwarf_function_signatures(elf_path, function_names);
   }
 
   std::istringstream stream(output);
@@ -711,69 +698,6 @@ void attach_discovered_function_signatures(
   }
 }
 
-json_object* capture_probe_to_json(const std::shared_ptr<datacrumbs::CaptureProbe>& capture_probe) {
-  json_object* config = json_object_new_object();
-  json_object_object_add(config, "name", json_object_new_string(capture_probe->name.c_str()));
-  json_object_object_add(config, "capture_type",
-                         json_object_new_string(capture_type_to_string(capture_probe->type)));
-  json_object_object_add(config, "probe_type",
-                         json_object_new_string(probe_type_to_string(capture_probe->probe_type)));
-  json_object_object_add(config, "regex", json_object_new_string(capture_probe->regex.c_str()));
-  json_object_object_add(config, "enable_explorer",
-                         json_object_new_boolean(capture_probe->enable_explorer));
-  if (!capture_probe->function_arguments.empty()) {
-    json_object* function_arguments = json_object_new_object();
-    for (const auto& [function_name, arg_specs] : capture_probe->function_arguments) {
-      json_object* arg_list = json_object_new_array();
-      for (const auto& arg_spec : arg_specs) {
-        json_object_array_add(arg_list, arg_spec.toJson());
-      }
-      json_object_object_add(function_arguments, function_name.c_str(), arg_list);
-    }
-    json_object_object_add(config, "function_arguments", function_arguments);
-  }
-
-  switch (capture_probe->type) {
-    case datacrumbs::CaptureType::HEADER: {
-      auto header_probe = std::static_pointer_cast<datacrumbs::HeaderCaptureProbe>(capture_probe);
-      json_object_object_add(config, "file", json_object_new_string(header_probe->file.c_str()));
-      break;
-    }
-    case datacrumbs::CaptureType::BINARY: {
-      auto binary_probe = std::static_pointer_cast<datacrumbs::BinaryCaptureProbe>(capture_probe);
-      json_object_object_add(config, "file", json_object_new_string(binary_probe->file.c_str()));
-      json_object_object_add(config, "include_offsets",
-                             json_object_new_boolean(binary_probe->include_offsets));
-      break;
-    }
-    case datacrumbs::CaptureType::USDT: {
-      auto usdt_probe = std::static_pointer_cast<datacrumbs::USDTCaptureProbe>(capture_probe);
-      json_object_object_add(config, "binary_path",
-                             json_object_new_string(usdt_probe->binary_path.c_str()));
-      json_object_object_add(config, "provider",
-                             json_object_new_string(usdt_probe->provider.c_str()));
-      break;
-    }
-    case datacrumbs::CaptureType::CUSTOM: {
-      auto custom_probe = std::static_pointer_cast<datacrumbs::CustomCaptureProbe>(capture_probe);
-      json_object_object_add(config, "file",
-                             json_object_new_string(custom_probe->bpf_file.c_str()));
-      json_object_object_add(config, "probes",
-                             json_object_new_string(custom_probe->probe_file.c_str()));
-      json_object_object_add(config, "start_event_id",
-                             json_object_new_int64(custom_probe->start_event_id));
-      json_object_object_add(config, "process_header",
-                             json_object_new_string(custom_probe->process_header.c_str()));
-      json_object_object_add(config, "event_type", json_object_new_int64(custom_probe->event_type));
-      break;
-    }
-    case datacrumbs::CaptureType::KSYM:
-      break;
-  }
-
-  return config;
-}
-
 json_object* configured_environment_to_json() {
   static const char* kEnvVars[] = {
       "DATACRUMBS_VERSION",
@@ -817,7 +741,8 @@ json_object* configured_environment_to_json() {
 
   json_object* env_json = json_object_new_object();
   for (const char* env_var : kEnvVars) {
-    json_object_object_add(env_json, env_var, string_or_empty_json(std::getenv(env_var)));
+    const std::string value = datacrumbs::ConfigurationManager::env_text(env_var);
+    json_object_object_add(env_json, env_var, json_object_new_string(value.c_str()));
   }
   return env_json;
 }
@@ -826,8 +751,6 @@ json_object* configured_environment_to_json() {
 
 namespace datacrumbs {
 
-// Constructor for ProbeExplorer, initializes the configuration manager
-// singleton
 ProbeExplorer::ProbeExplorer(int argc, char** argv, bool load_capture_probes) {
   DC_LOG_TRACE("ProbeExplorer::ProbeExplorer - start");
   configManager_ =
@@ -873,7 +796,6 @@ ProbeExplorer::Extract_Exclusions() {
               json_object* func_obj = json_object_array_get_idx(funcs_obj, j);
 
               if (func_obj && json_object_get_type(func_obj) == json_type_string) {
-                // check the function name
                 std::string func_name = json_object_get_string(func_obj);
                 if (func_name.find('/') != std::string::npos ||
                     func_name.find('\\') != std::string::npos ||
@@ -910,21 +832,49 @@ ProbeExplorer::Extract_Exclusions() {
 
   DC_LOG_TRACE("ProbeExplorer::validate_exclusion_file - end");
 }
-// Extracts probes based on configuration and exclusion file
+// Finds function symbols in `binary` that call a symbol matching a `sensitive` regex, by scanning
+// objdump disassembly for `bl` targets. Used to move frida-unsafe hot functions (those that reach a
+// DOCA/RDMA call) off a hot layer automatically, without listing them by hand.
+static std::unordered_set<std::string> functions_calling_sensitive(
+    const std::string& binary, const std::vector<std::string>& sensitive) {
+  std::unordered_set<std::string> result;
+  if (sensitive.empty()) return result;
+  std::vector<std::regex> pats;
+  for (const auto& s : sensitive) pats.emplace_back(s);
+  const std::string out = run_command("objdump -d " + shell_escape(binary) + " 2>/dev/null");
+  std::istringstream stream(out);
+  std::string line, current;
+  const std::regex func_re(R"(^[0-9a-f]+ <([^>]+)>:)");
+  const std::regex call_re(R"(\bbl\s+[0-9a-f]+ <([^>@]+))");
+  std::smatch m;
+  while (std::getline(stream, line)) {
+    if (std::regex_search(line, m, func_re)) {
+      current = m[1].str();
+      continue;
+    }
+    if (current.empty() || !std::regex_search(line, m, call_re)) continue;
+    const std::string target = m[1].str();
+    for (const auto& p : pats)
+      if (std::regex_search(target, p)) {
+        result.insert(current);
+        break;
+      }
+  }
+  return result;
+}
+
 std::vector<std::shared_ptr<Probe>> ProbeExplorer::extractProbes() {
   DC_LOG_TRACE("ProbeExplorer::extractProbes - start");
   auto exclusionMap = Extract_Exclusions();
 
-  // Log the contents of the exclusion map for debugging
   DC_LOG_DEBUG("Exclusion Map Contents:");
   for (const auto& [probe_name, func_set] : exclusionMap) {
     DC_LOG_DEBUG("Probe: %s", probe_name.c_str());
-    for (const auto& func : func_set) {
+    for ([[maybe_unused]] const auto& func : func_set) {
       DC_LOG_DEBUG("  Excluded Function: %s", func.c_str());
     }
   }
 
-  // Load additional invalid probes from file if specified
   if (!configManager_->probe_invalid_file_path.empty() &&
       std::filesystem::exists(configManager_->probe_invalid_file_path)) {
     std::ifstream ifs(configManager_->probe_invalid_file_path);
@@ -951,7 +901,6 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::extractProbes() {
                 func_set.insert(json_object_get_string(func_obj));
               }
             }
-            // Merge with existing exclusion map if present
             auto& existing_set = exclusionMap[probe_name];
             existing_set.insert(func_set.begin(), func_set.end());
           }
@@ -1150,6 +1099,16 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::extractProbes() {
             }
           }
           break;
+        case CaptureType::TRACEPOINT:
+          DC_LOG_INFO("Extracting kernel tracepoint probes...");
+          result.function_names =
+              datacrumbs::Singleton<TracepointCapture>::get_instance()->getFunctionsByRegex(
+                  capture_probe->regex);  // "category:name"; no BTF signatures for tracepoints
+          break;
+        case CaptureType::PERF_EVENT:
+          DC_LOG_INFO("Extracting perf sampling events...");
+          result.function_names = perf_events_by_regex(capture_probe->regex);
+          break;
         case CaptureType::CUSTOM:
           DC_LOG_INFO("Extracting custom probes...");
           if (auto customProbe = std::static_pointer_cast<CustomCaptureProbe>(capture_probe)) {
@@ -1213,7 +1172,6 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::extractProbes() {
     });
   };
 
-  // Iterate over all capture probes from configuration
   const size_t total_capture_probes = configManager_->capture_probes.size();
   size_t reused_probe_count = 0;
   for (const auto& capture_probe : configManager_->capture_probes) {
@@ -1235,24 +1193,27 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::extractProbes() {
       case ProbeType::CUSTOM:
         probe = std::make_shared<CustomProbe>();
         break;
+      case ProbeType::TRACEPOINT:
+        probe = std::make_shared<TracepointProbe>();
+        break;
+      case ProbeType::PERF_EVENT:
+        probe = std::make_shared<PerfEventProbe>();
+        break;
       default:
         DC_LOG_ERROR("Unknown probe type encountered in extractProbes()");
         throw std::runtime_error("Unknown probe type encountered in extractProbes()");
     }
 
     if (!capture_probe->enable_explorer) {
-      // Check if probe already exists and can be reused
       auto existingProbeIt = existingProbesMap.find(capture_probe->name);
       if (existingProbeIt != existingProbesMap.end()) {
         DC_LOG_INFO("Found existing probe '%s', reusing it", capture_probe->name.c_str());
         auto existingProbe = existingProbeIt->second;
 
-        // Copy fields from existing probe to new probe
         probe->name = existingProbe->name;
         probe->functions = existingProbe->functions;
         probe->function_arguments = existingProbe->function_arguments;
 
-        // Copy type-specific fields based on probe type
         switch (capture_probe->probe_type) {
           case ProbeType::UPROBE:
             if (auto existingUprobe = std::dynamic_pointer_cast<UProbe>(existingProbe)) {
@@ -1281,12 +1242,10 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::extractProbes() {
             }
             break;
           default:
-            // For SYSCALLS and KPROBE, no additional fields to copy
             break;
         }
         DC_LOG_INFO("Reused existing probe: %s", probe->name.c_str());
 
-        // Validate the existing probe and add it to the list
         if (probe->validate()) {
           DC_LOG_INFO("Valid probe reused: %s", probe->name.c_str());
           probes.push_back(probe);
@@ -1294,7 +1253,7 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::extractProbes() {
           DC_LOG_INFO("[ProbeExplorer] Progress reused %s after '%s'",
                       format_progress(probes.size(), total_capture_probes).c_str(),
                       capture_probe->name.c_str());
-          continue;  // Skip the rest of the processing for this probe
+          continue;
         } else {
           DC_LOG_WARN("Existing probe '%s' failed validation, will extract fresh",
                       probe->name.c_str());
@@ -1335,21 +1294,90 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::extractProbes() {
     auto functionNames = std::move(result.function_names);
     auto discovered_function_signatures = std::move(result.discovered_function_signatures);
 
-    // Filter function names by regex if specified
+    // Symbols carry a ":0xADDR" suffix and regex_match needs the whole string, so a natural
+    // "^name$" matches nothing. Match the bare symbol too.
     if (!capture_probe->regex.empty()) {
       std::regex re(capture_probe->regex, std::regex_constants::icase);
       std::vector<std::string> filteredNames;
       for (const auto& name : functionNames) {
-        if (std::regex_match(name, re)) {
+        const std::string bare = name.substr(0, name.find(':'));
+        if (std::regex_match(name, re) || std::regex_match(bare, re)) {
           filteredNames.push_back(name);
         }
+      }
+      if (filteredNames.empty() && !functionNames.empty()) {
+        DC_LOG_WARN("[ProbeExplorer] '%s': regex '%s' matched none of %zu symbols (e.g. '%s')",
+                    capture_probe->name.c_str(), capture_probe->regex.c_str(), functionNames.size(),
+                    functionNames.front().c_str());
       }
       functionNames = std::move(filteredNames);
     }
 
-    probe->name = capture_probe->name;
+    // Split a bpftime hot layer: functions that are frida-unsafe (inline hooking them corrupts the
+    // workload, e.g. a DOCA/RDMA send) go to a kernel uprobe twin ("<name>_k"), the rest stay hot.
+    // Unsafe = matches hot_exclude by name, OR (hot_sensitive) calls a symbol reaching DOCA/RDMA.
+    if (capture_probe->hot && capture_probe->type == CaptureType::BINARY &&
+        (!capture_probe->hot_exclude.empty() || !capture_probe->hot_sensitive.empty())) {
+      auto bp = std::static_pointer_cast<BinaryCaptureProbe>(capture_probe);
+      const bool has_ex = !capture_probe->hot_exclude.empty();
+      const std::regex ex(has_ex ? capture_probe->hot_exclude : "$^", std::regex_constants::icase);
+      const auto sensitive_callers =
+          functions_calling_sensitive(bp->file, capture_probe->hot_sensitive);
+      // Decide demotion per offset, not per name: C1/C2 ctors and D1/D2 dtors fold to one address.
+      // A frida hook and a uprobe BRK on the same offset SIGTRAPs, so if any alias at an offset is
+      // unsafe, the whole offset is demoted. names carry a ":0xADDR" suffix; sensitive_callers do
+      // not.
+      auto offset_key = [](const std::string& n) {
+        const auto p = n.find(':');
+        return p == std::string::npos ? n : n.substr(p);
+      };
+      std::unordered_set<std::string> demoted_offsets;
+      for (auto& name : functionNames)
+        if ((has_ex && std::regex_search(name, ex)) ||
+            sensitive_callers.count(name.substr(0, name.find(':'))))
+          demoted_offsets.insert(offset_key(name));
+      std::vector<std::string> kept, twin_fns;
+      std::unordered_set<std::string> twin_offsets;
+      for (auto& name : functionNames) {
+        if (!demoted_offsets.count(offset_key(name))) {
+          kept.push_back(name);
+        } else if (twin_offsets.insert(offset_key(name)).second &&
+                   global_function_names.insert(bp->file + "_" + name).second) {
+          twin_fns.push_back(name);
+        }
+      }
+      functionNames = std::move(kept);
+      if (!twin_fns.empty()) {
+        std::sort(twin_fns.begin(), twin_fns.end());
+        auto twin = std::make_shared<UProbe>();
+        twin->name = capture_probe->name + "_k";
+        twin->trace_event_type = capture_probe->trace_event_type;
+        twin->binary_path = bp->file;
+        twin->include_offsets = bp->include_offsets;
+        twin->functions = twin_fns;
+        attach_discovered_function_signatures(twin.get(), ProbeType::UPROBE, twin_fns,
+                                              discovered_function_signatures);
+        if (twin->validate()) {
+          probes.push_back(twin);
+          ++extracted_probe_count;
+          DC_LOG_INFO("[ProbeExplorer] hot split '%s': %zu hot, %zu -> kernel uprobe '%s'",
+                      capture_probe->name.c_str(), functionNames.size(), twin_fns.size(),
+                      twin->name.c_str());
+        }
+      }
+    }
 
-    // For syscall probes, normalize to base syscall names expected by attach_ksyscall.
+    probe->name = capture_probe->name;
+    probe->trace_event_type = capture_probe->trace_event_type;  // .pfw domain
+    probe->system_wide = capture_probe->system_wide;            // tracepoint pid-gate opt-out
+    probe->aggregate = capture_probe->aggregate;                // count/duration instead of events
+    probe->hot = capture_probe->hot;                            // uprobe -> bpftime userspace path
+    probe->capture_stack = capture_probe->capture_stack;        // grab user stack at tracepoints
+    probe->sample_freq = capture_probe->sample_freq;            // perf_event sampling rate
+    probe->stack_dump_ratio = capture_probe->stack_dump_ratio;  // 1-in-N raw stack dumps
+    probe->gate_tid_arg = capture_probe->gate_tid_arg;
+
+    // attach_ksyscall expects base syscall names, without the sys_ or __x64_sys_ prefix.
     if (capture_probe->probe_type == ProbeType::SYSCALLS) {
       for (auto& name : functionNames) {
         if (name.rfind("__x64_sys_", 0) == 0) {
@@ -1360,7 +1388,6 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::extractProbes() {
       }
     }
 
-    // Exclude functions as per exclusion map
     if (!exclusionMap.empty()) {
       auto it = exclusionMap.find(capture_probe->name);
       if (it != exclusionMap.end()) {
@@ -1394,7 +1421,6 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::extractProbes() {
           DC_LOG_INFO("[ProbeExplorer] Function name '%s' from %s.", name.c_str(),
                       capture_probe->name.c_str());
           auto combined_name = name;
-          // Check and insert into global set to avoid duplicates
           if (!global_function_names.insert(combined_name).second) {
             DC_LOG_WARN(
                 "[ProbeExplorer] Function name '%s' already processed. "
@@ -1416,7 +1442,6 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::extractProbes() {
             std::vector<std::string> validFunctionNames;
             for (const auto& name : functionNames) {
               auto combined_name = binaryProbe->file + "_" + name;
-              // Check and insert into global set to avoid duplicates
               if (!global_function_names.insert(combined_name).second) {
                 DC_LOG_WARN(
                     "[ProbeExplorer] Function name '%s' already "
@@ -1439,7 +1464,6 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::extractProbes() {
             std::vector<std::string> validFunctionNames;
             for (const auto& name : functionNames) {
               auto combined_name = usdtProbe->binary_path + "_" + usdtProbe->provider + "_" + name;
-              // Check and insert into global set to avoid duplicates
               if (!global_function_names.insert(combined_name).second) {
                 DC_LOG_WARN(
                     "[ProbeExplorer] Function name '%s' already "
@@ -1455,13 +1479,14 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::extractProbes() {
         }
         break;
       }
+      case CaptureType::PERF_EVENT:  // same kernel-name dedup as KSYM (KernelCaptureProbe)
+      case CaptureType::TRACEPOINT:
       case CaptureType::KSYM: {
         DC_LOG_INFO("Deduplicating kernel symbol probes...");
         if (auto ksymProbe = std::static_pointer_cast<KernelCaptureProbe>(capture_probe)) {
           std::vector<std::string> validFunctionNames;
           for (const auto& name : functionNames) {
             auto combined_name = name;
-            // Check and insert into global set to avoid duplicates
             if (!global_function_names.insert(combined_name).second) {
               DC_LOG_WARN(
                   "[ProbeExplorer] Function name '%s' already processed. "
@@ -1483,7 +1508,6 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::extractProbes() {
           DC_LOG_DEBUG("[ProbeExplorer] Function name '%s' from %s.", name.c_str(),
                        capture_probe->name.c_str());
           auto combined_name = name;
-          // Check and insert into global set to avoid duplicates
           if (!global_function_names.insert(combined_name).second) {
             DC_LOG_WARN(
                 "[ProbeExplorer] Function name '%s' already processed. "
@@ -1504,12 +1528,16 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::extractProbes() {
     probe->functions = functionNames;
     attach_discovered_function_signatures(probe.get(), capture_probe->probe_type, functionNames,
                                           discovered_function_signatures);
+    // Last, so an explicit spec beats a discovered signature: the tracefs auto-parse fills
+    // MAX_CAPTURE_ARGS in file order and never reaches sched_switch's next_pid.
+    for (const auto& [fn, specs] : capture_probe->function_arguments) {
+      probe->function_arguments[fn] = specs;
+    }
 
-    // Validate the probe before adding
     if (!probe->validate()) {
       DC_LOG_ERROR("Probe validation failed for: %s", probe->name.c_str());
       has_invalid_probes_ = true;
-      return;  // Skip invalid probes
+      return;
     }
     DC_LOG_INFO("Valid probe extracted: %s", probe->name.c_str());
     probes.push_back(probe);
@@ -1598,7 +1626,7 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::extractProbes() {
 void ProbeExplorer::create_exclusion_file(std::vector<std::shared_ptr<Probe>> probes) {
   DC_LOG_TRACE("ProbeExplorer::create_exclusion_file - start");
   json_object* jexarray = json_object_new_array();
-  // Serialize each probe to JSON without functions
+  // toJson(false): the exclusion template omits functions.
   for (const auto& probe : probes) {
     json_object* jexclude = nullptr;
     switch (probe->type) {
@@ -1617,13 +1645,19 @@ void ProbeExplorer::create_exclusion_file(std::vector<std::shared_ptr<Probe>> pr
       case ProbeType::CUSTOM:
         jexclude = std::dynamic_pointer_cast<CustomProbe>(probe)->toJson(false);
         break;
+      case ProbeType::TRACEPOINT:
+        jexclude = std::dynamic_pointer_cast<TracepointProbe>(probe)->toJson(false);
+        break;
+      case ProbeType::PERF_EVENT:
+        jexclude = std::dynamic_pointer_cast<PerfEventProbe>(probe)->toJson(false);
+        break;
       default:
         DC_LOG_ERROR("Unknown probe type encountered.");
-        continue;  // Skip unknown types
+        continue;
     }
     if (!jexclude) {
       DC_LOG_ERROR("Failed to serialize probe for exclusion: %s", probe->name.c_str());
-      continue;  // Skip serialization failure
+      continue;
     }
     json_object_array_add(jexarray, jexclude);
   }
@@ -1643,7 +1677,6 @@ void ProbeExplorer::create_exclusion_file(std::vector<std::shared_ptr<Probe>> pr
   DC_LOG_TRACE("ProbeExplorer::create_exclusion_file - end");
 }
 
-// Loads existing probes from JSON file and builds a map for querying
 std::unordered_map<std::string, std::shared_ptr<Probe>> ProbeExplorer::loadExistingProbes() {
   DC_LOG_TRACE("ProbeExplorer::loadExistingProbes - start");
   std::unordered_map<std::string, std::shared_ptr<Probe>> existingProbesMap;
@@ -1677,7 +1710,6 @@ std::unordered_map<std::string, std::shared_ptr<Probe>> ProbeExplorer::loadExist
 
             std::shared_ptr<Probe> probe;
 
-            // Create appropriate probe type based on the type field
             switch (probe_type) {
               case ProbeType::UPROBE:
                 probe = std::make_shared<UProbe>();
@@ -1699,6 +1731,14 @@ std::unordered_map<std::string, std::shared_ptr<Probe>> ProbeExplorer::loadExist
                 probe = std::make_shared<CustomProbe>();
                 probe->type = ProbeType::CUSTOM;
                 break;
+              case ProbeType::TRACEPOINT:
+                probe = std::make_shared<TracepointProbe>();
+                probe->type = ProbeType::TRACEPOINT;
+                break;
+              case ProbeType::PERF_EVENT:
+                probe = std::make_shared<PerfEventProbe>();
+                probe->type = ProbeType::PERF_EVENT;
+                break;
               default:
                 DC_LOG_WARN("Unknown probe type '%d' for probe '%s'", static_cast<int>(probe_type),
                             probe_name.c_str());
@@ -1707,7 +1747,6 @@ std::unordered_map<std::string, std::shared_ptr<Probe>> ProbeExplorer::loadExist
 
             probe->name = probe_name;
 
-            // Load functions array if present
             json_object* funcs_obj = nullptr;
             if (json_object_object_get_ex(probe_obj, "functions", &funcs_obj) &&
                 json_object_get_type(funcs_obj) == json_type_array) {
@@ -1720,7 +1759,6 @@ std::unordered_map<std::string, std::shared_ptr<Probe>> ProbeExplorer::loadExist
               }
             }
 
-            // Load type-specific fields
             switch (probe_type) {
               case ProbeType::UPROBE:
                 if (auto uprobe = std::dynamic_pointer_cast<UProbe>(probe)) {
@@ -1778,10 +1816,8 @@ std::unordered_map<std::string, std::shared_ptr<Probe>> ProbeExplorer::loadExist
                 break;
               case ProbeType::SYSCALLS:
               case ProbeType::KPROBE:
-                // No additional fields to load for these types
                 break;
               default:
-                // Already handled above, should not reach here
                 break;
             }
 
@@ -1811,7 +1847,6 @@ std::unordered_map<std::string, std::shared_ptr<Probe>> ProbeExplorer::loadExist
   return existingProbesMap;
 }
 
-// Writes extracted probes to a JSON file and returns the probe list
 std::vector<std::shared_ptr<Probe>> ProbeExplorer::writeProbesToJson() {
   DC_LOG_TRACE("ProbeExplorer::writeProbesToJson - start");
   auto probes = extractProbes();
@@ -1825,7 +1860,6 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::writeProbesToJson() {
   }
   json_object* jarray = json_object_new_array();
 
-  // Serialize each probe to JSON
   for (const auto& probe : probes) {
     json_object* jprobe = nullptr;
     switch (probe->type) {
@@ -1844,13 +1878,19 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::writeProbesToJson() {
       case ProbeType::CUSTOM:
         jprobe = std::dynamic_pointer_cast<CustomProbe>(probe)->toJson();
         break;
+      case ProbeType::TRACEPOINT:
+        jprobe = std::dynamic_pointer_cast<TracepointProbe>(probe)->toJson();
+        break;
+      case ProbeType::PERF_EVENT:
+        jprobe = std::dynamic_pointer_cast<PerfEventProbe>(probe)->toJson();
+        break;
       default:
         DC_LOG_ERROR("Unknown probe type encountered.");
-        continue;  // Skip unknown types
+        continue;
     }
     if (!jprobe) {
       DC_LOG_ERROR("Failed to serialize probe: %s", probe->name.c_str());
-      continue;  // Skip serialization failure
+      continue;
     }
     json_object_array_add(jarray, jprobe);
   }
@@ -1878,6 +1918,7 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::writeProbesToJson() {
   if (!signed_ok) {
     DC_LOG_ERROR("Failed to sign probes through datacrumbs_probe_manager service: %s",
                  signing_error.c_str());
+    signing_failed_ = true;
     json_object_put(root);
     json_object_put(jarray);
     return probes;
@@ -1893,14 +1934,95 @@ std::vector<std::shared_ptr<Probe>> ProbeExplorer::writeProbesToJson() {
 
   if (!datacrumbs::probe_file::write_gzip_file(configManager_->probe_file_path, signed_payload)) {
     DC_LOG_ERROR("Failed to open file: %s", configManager_->probe_file_path.c_str());
+    signing_failed_ = true;
   } else {
     DC_LOG_INFO("Signed probe file written: %s", configManager_->probe_file_path.c_str());
+    if (!writeClientConfig(configManager_->probe_file_path)) signing_failed_ = true;
   }
 
   json_object_put(root);
   json_object_put(jarray);
   DC_LOG_TRACE("ProbeExplorer::writeProbesToJson - end");
   return probes;
+}
+
+/// Resolve the yaml's client module layers into the settings the preloaded client reads.
+///
+/// Written beside the probe file as KEY=VALUE, which is all the client can parse: it is injected
+/// into every traced process, where json and zlib would be two dependencies too many.
+bool ProbeExplorer::writeClientConfig(const std::filesystem::path& probe_path) {
+  const auto& layers = configManager_->client_layers;
+
+  static const std::unordered_map<std::string, std::string> kEnvOf = {
+      {"posix", "POSIX"},
+      {"stdio", "STDIO"},
+      {"vendor_api", "API"},
+      {"doca_engine", "DOCA_ENGINE"},
+      {"ibverbs_hwts", "HWTS"}};
+  static const std::unordered_map<std::string, std::string> kEnableOf = {
+      {"posix", "DATACRUMBS_POSIX"},
+      {"stdio", "DATACRUMBS_STDIO"},
+      {"vendor_api", "DATACRUMBS_API"},
+      {"doca_engine", "DATACRUMBS_ENGINE"},
+      {"ibverbs_hwts", "DATACRUMBS_HWTS"}};
+
+  std::map<std::string, std::string> out;
+  for (const auto& l : layers) {
+    const auto env = kEnvOf.find(l.module);
+    if (env == kEnvOf.end()) {
+      DC_LOG_ERROR("capture probe '%s' names unknown module '%s'", l.name.c_str(),
+                   l.module.c_str());
+      return false;
+    }
+    out[kEnableOf.at(l.module)] = "1";
+    if (l.pattern.empty()) continue;
+    const char* which = l.off ? "OFF" : (l.aggregate ? "AGGREGATE" : "RECORD");
+    std::string& slot = out["DATACRUMBS_" + env->second + "_" + which];
+    if (!slot.empty()) slot += ",";
+    // Marked, because the client reads a bare pattern as a glob and the yaml's two keys mean
+    // different things.
+    if (l.is_regex) slot += "regex:";
+    slot += l.pattern;
+  }
+  // The client records every wrapped call unless told otherwise, so a module whose every layer
+  // names what to capture needs the rest off, or the pattern selects nothing. A bare layer, or
+  // one that only names what to drop, keeps the rest.
+  std::map<std::string, bool> whole;
+  for (const auto& l : layers) whole[l.module] = whole[l.module] || l.pattern.empty() || l.off;
+  for (const auto& [module, keep] : whole)
+    if (!keep) out["DATACRUMBS_" + kEnvOf.at(module) + "_OFF"] = "*";
+
+  // Calls never to wrap. `off` drops the record but still pays for the call, which is no use for a
+  // polling loop, so these are removed from the binding table instead. select_bindings() reads this
+  // shape; the patterns are globs, so no regex flavour is involved.
+  std::vector<std::string> skip;
+  for (const auto& l : layers)
+    if (l.module == "vendor_api") skip.insert(skip.end(), l.skip.begin(), l.skip.end());
+  if (!skip.empty()) {
+    const std::filesystem::path sel = probe_path.string() + ".client.api.yaml";
+    std::ofstream sf(sel);
+    if (!sf.is_open()) {
+      DC_LOG_ERROR("Failed to write api selection: %s", sel.string().c_str());
+      return false;
+    }
+    sf << "api_trace:\n  exclude:\n";
+    for (const auto& g : skip) sf << "    - \"" << g << "\"\n";
+    out["DATACRUMBS_API_CONFIG"] = sel.string();
+    DC_LOG_INFO("api selection: %zu excluded -> %s", skip.size(), sel.string().c_str());
+  }
+
+  const std::filesystem::path path = probe_path.string() + ".client";
+  std::ofstream f(path);
+  if (!f.is_open()) {
+    DC_LOG_ERROR("Failed to write client configuration: %s", path.string().c_str());
+    return false;
+  }
+  // Written even with nothing in it. A run names this path unconditionally, so absent means the
+  // configurator failed, and empty means the probeset asked for no client module.
+  for (const auto& [k, v] : out) f << k << "=" << v << "\n";
+  DC_LOG_INFO("client configuration: %zu settings from %zu layers -> %s", out.size(), layers.size(),
+              path.string().c_str());
+  return true;
 }
 
 bool ProbeExplorer::writeSystemProbeJson() {
@@ -1933,6 +2055,8 @@ bool ProbeExplorer::writeSystemProbeJson() {
                  configManager_->system_probe_path.string().c_str());
     return false;
   }
+
+  if (!writeClientConfig(configManager_->system_probe_path)) return false;
 
   DC_LOG_INFO("Compressed system probe written to: %s",
               configManager_->system_probe_path.string().c_str());

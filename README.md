@@ -139,3 +139,25 @@ ctest --test-dir build --output-on-failure
 ```
 
 The utility Docker and formatting workflows now live in this repository as well.
+
+### Dependency paths
+
+The configure step looks for each dependency in `CMAKE_PREFIX_PATH`, then in the vendor install
+root. When it finds nothing, the feature that needs it is skipped and the configure summary
+prints the variable to set. Pass a path with `-D<variable>=<path>` to override the search.
+
+| Variable | Probe file | Feature |
+|---|---|---|
+| `DATACRUMBS_DOCA_INCLUDE` | `doca_dev.h` | DOCA module, DPA anchor, DPA telemetry and diag plugins, wrap list |
+| `DATACRUMBS_DOCA_LIB` | `libdoca_common.so` | link directory for the DOCA libraries (default: `<doca root>/lib/aarch64-linux-gnu`) |
+| `DATACRUMBS_FLEXIO_INCLUDE` | `libflexio/flexio.h` | FlexIO symbols in the wrap list |
+| `DATACRUMBS_FLEXIO_LIB` | `libflexio.so` | DPA anchor link |
+| `DATACRUMBS_PKA_INCLUDE` | `pka.h` | PKA symbols in the wrap list |
+| `DATACRUMBS_LIBCLANG` | `libclang-14.so` | wrap list generator |
+| `DATACRUMBS_PYLIB` | `clang/cindex.py` | wrap list generator (python bindings of libclang) |
+| `DATACRUMBS_IBVERBS_INCLUDE` | `infiniband/verbs.h` | rdma-core headers the wrap list is generated from (default `/usr/include`) |
+| `DATACRUMBS_MLX5_KERNEL_INCLUDE` | `device.h`, `mlx5_ifc.h` | mlx5 device op tables (default: newest OFED or kernel headers under `/usr/src`) |
+| `FRIDA_GUM_DIR` | `libfrida-gum.a` | DOCA hardware-timestamp variant of the ibverbs module |
+| `DATACRUMBS_DPA_ANCHOR_MCPU` | | dpacc target of the anchor kernel (default `nv-dpa-bf3`) |
+
+`trails/provision.py` in dpu-trails passes every path from `provision.cross` in `cluster.yaml`.

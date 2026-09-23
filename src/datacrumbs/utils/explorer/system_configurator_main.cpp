@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: MIT
-// Owner: hariharandev1@llnl.gov
 
 #include <datacrumbs/common/logging.h>
 #include <datacrumbs/common/probe_file.h>

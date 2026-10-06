@@ -8,8 +8,6 @@
 
 #include <fstream>
 
-// --- Type Definitions and Global Structures ---
-
 typedef enum { FORMAT_TEXT, FORMAT_DOT } OutputFormat;
 
 typedef struct Node {
@@ -27,7 +25,6 @@ typedef struct Node {
   int depth = 0;
 } Node;
 
-// Global arguments parsed from command line
 typedef struct Args {
   int show_percentage;
   int is_exclusive_metric;
@@ -115,7 +112,7 @@ void find_nodes_by_name(Node** nodes, int count, const char* name, Node*** found
     }
   }
 }
-// For events starting at the same time, process the larger (parent) one first
+// When two events start at the same time, sort the one with the longer duration first.
 int compare_nodes(const void* a, const void* b) {
   Node* nodeA = *(Node**)a;
   Node* nodeB = *(Node**)b;
@@ -144,12 +141,12 @@ void print_tree(Node** nodes, int count, Args* args, long long total_run_time, c
     Node* node = nodes[i];
 
     double percentage = 0.0;
-    if (parent_inclusive_dur == -1) {  // Root node
+    if (parent_inclusive_dur == -1) {  // -1 means this node is a root
       if (total_run_time > 0) percentage = ((double)node->dur / total_run_time) * 100.0;
       if (args->min_percent_root > 0 && percentage < args->min_percent_root) {
         continue;
       }
-    } else {  // Child node
+    } else {
       if (parent_inclusive_dur > 0) percentage = ((double)node->dur / parent_inclusive_dur) * 100.0;
       if (args->min_percent_children > 0 && percentage < args->min_percent_children) {
         continue;
@@ -179,18 +176,14 @@ void print_tree(Node** nodes, int count, Args* args, long long total_run_time, c
       char sanitized_name[1024];
       sanitize_for_graphing(node->name, sanitized_name, sizeof(sanitized_name));
 
-      // Calculate the exclusive duration's percentage of the total run time.
       double exclusive_percentage_of_total = 0.0;
       if (total_run_time > 0) {
         exclusive_percentage_of_total = ((double)node->exclusive_dur / total_run_time) * 100.0;
       }
 
-      // Define the node with a label showing its name, exclusive duration, and
-      // percentage of total.
       printf("  \"%s\" [label=\"%s\\nExclusive: %lld (%.2f%%)\"];\n", sanitized_name, node->name,
              node->exclusive_dur, exclusive_percentage_of_total);
 
-      // If it's a child node, draw an edge from its parent.
       if (parent_inclusive_dur != -1) {
         char sanitized_parent[1024];
         sanitize_for_graphing(stack_prefix, sanitized_parent, sizeof(sanitized_parent));
@@ -207,8 +200,8 @@ void print_tree(Node** nodes, int count, Args* args, long long total_run_time, c
                  (i == count - 1) ? "    " : "│   ");
       }
 
-      // For DOT format, the new stack prefix is the current node's name, used
-      // to identify the parent in the recursive call.
+      // For DOT output, stack_prefix carries the current node's name so the
+      // recursive call can identify its parent.
       if (args->output_format == FORMAT_DOT) {
         snprintf(new_stack_prefix, sizeof(new_stack_prefix), "%s", node->name);
       }
@@ -220,7 +213,6 @@ void print_tree(Node** nodes, int count, Args* args, long long total_run_time, c
 }
 
 int main(int argc, char* argv[]) {
-  // --- Argument Parsing ---
   Args args = {0, 0, 0, 0.0, 0.0, FORMAT_TEXT, NULL, NULL, 0, 20};
   int opt;
   struct option long_options[] = {{"help", no_argument, 0, 'h'},
@@ -281,15 +273,20 @@ int main(int argc, char* argv[]) {
   }
   args.filepath = argv[optind];
 
-  // --- File Reading ---
   FILE* fp = fopen(args.filepath, "rb");
   if (!fp) {
     perror("Error opening file for analysis");
     return EXIT_FAILURE;
   }
   fseek(fp, 0, SEEK_END);
-  long file_size = ftell(fp);
+  const long ftell_size = ftell(fp);
   fseek(fp, 0, SEEK_SET);
+  if (ftell_size < 0) {
+    perror("Error reading file");
+    fclose(fp);
+    return EXIT_FAILURE;
+  }
+  const size_t file_size = static_cast<size_t>(ftell_size);
   char* buffer = (char*)malloc(file_size + 1);
   if (!buffer || fread(buffer, 1, file_size, fp) != file_size) {
     perror("Error reading file");
@@ -300,7 +297,6 @@ int main(int argc, char* argv[]) {
   buffer[file_size] = '\0';
   fclose(fp);
 
-  // --- JSON Parsing and Node Creation ---
   Node** all_nodes = NULL;
   int total_nodes = 0;
   int capacity = 0;
@@ -366,7 +362,6 @@ int main(int argc, char* argv[]) {
     return 0;
   }
 
-  // --- Call Tree Construction ---
   if (args.force_sort) {
     qsort(all_nodes, total_nodes, sizeof(Node*), compare_nodes);
   }
@@ -444,7 +439,6 @@ int main(int argc, char* argv[]) {
   free(stack);
   outFile.close();
 
-  // --- Data Processing and Output ---
   calculate_exclusive_times(root_calls, root_count);
 
   if (args.output_format == FORMAT_DOT) {
@@ -480,7 +474,7 @@ int main(int argc, char* argv[]) {
   } else {
     if (total_nodes > 0) {
       long long min_ts = -1, max_ts_end = 0;
-      if (total_nodes > 0) {  // Ensure all_nodes is not empty
+      if (total_nodes > 0) {
         min_ts = all_nodes[0]->ts;
         for (int i = 0; i < total_nodes; i++) {
           if (all_nodes[i]->ts < min_ts) min_ts = all_nodes[i]->ts;
@@ -505,7 +499,6 @@ int main(int argc, char* argv[]) {
     printf("}\n");
   }
 
-  // --- Final Cleanup ---
   for (int i = 0; i < total_nodes; i++) {
     free(all_nodes[i]->name);
     free(all_nodes[i]->children);

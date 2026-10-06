@@ -1,24 +1,15 @@
 // SPDX-License-Identifier: MIT
-// Owner: hariharandev1@llnl.gov
 
-/**
- * @file configuration_manager.cpp
- * @brief Implements the ConfigurationManager class for managing DataCrumbs
- * configuration.
- *
- * This file contains the implementation of the ConfigurationManager class,
- * which is responsible for parsing command-line arguments, loading YAML
- * configuration files, and setting up configuration parameters for the
- * DataCrumbs application. It also includes the ArgumentParser class for
- * handling command-line arguments and utility functions for deriving and
- * validating configuration values.
- */
-
-/**
- * std headers
- */
+#include <datacrumbs/common/enumerations.h>
+#include <datacrumbs/common/logging.h>
+#include <datacrumbs/common/probe_file.h>
+#include <datacrumbs/common/singleton.h>
+#include <datacrumbs/common/utils.h>
+#include <datacrumbs/utils/common/configuration_manager.h>
+#include <datacrumbs/utils/common/constants.h>
 #include <sys/resource.h>
 #include <unistd.h>
+#include <yaml-cpp/yaml.h>
 
 #include <algorithm>
 #include <cstdlib>
@@ -30,19 +21,6 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
-/**
- * Internal headers
- */
-#include <datacrumbs/common/enumerations.h>
-#include <datacrumbs/common/logging.h>  // <-- Added logging header
-#include <datacrumbs/common/probe_file.h>
-#include <datacrumbs/common/singleton.h>
-#include <datacrumbs/common/utils.h>
-#include <datacrumbs/utils/common/configuration_manager.h>
-/**
- * External headers
- */
-#include <yaml-cpp/yaml.h>
 
 namespace datacrumbs {
 
@@ -62,15 +40,6 @@ std::string runtime_timestamp() {
   std::ostringstream oss;
   oss << std::put_time(&tm_now, "%Y%m%d%H%M%S");
   return oss.str();
-}
-
-std::string json_string_or_empty(json_object* root, const char* key) {
-  json_object* value = nullptr;
-  if (!root || !json_object_object_get_ex(root, key, &value) ||
-      json_object_get_type(value) != json_type_string) {
-    return "";
-  }
-  return json_object_get_string(value);
 }
 
 std::shared_ptr<Probe> probe_from_json(json_object* probe_obj) {
@@ -108,18 +77,20 @@ std::filesystem::path absolute_normalized_path(const std::filesystem::path& inpu
   return absolute_path.lexically_normal();
 }
 
+// A probe's symbol filter, from either `regex` or the friendlier `glob`. Everything downstream
+// consumes one regex field, so a glob is translated here rather than carried as a second mode.
+std::string pattern_of(const YAML::Node& probe_node) {
+  if (probe_node["glob"]) {
+    return datacrumbs::utils::glob_to_regex(probe_node["glob"].as<std::string>());
+  }
+  if (probe_node["regex"]) {
+    return probe_node["regex"].as<std::string>();
+  }
+  return "";
+}
+
 }  // namespace
 
-// Singleton template specialization for ConfigurationManager
-template <>
-std::shared_ptr<datacrumbs::ConfigurationManager>
-    datacrumbs::Singleton<datacrumbs::ConfigurationManager>::instance = nullptr;
-template <>
-bool datacrumbs::Singleton<datacrumbs::ConfigurationManager>::stop_creating_instances = false;
-
-/**
- * YAML keys for configuration
- */
 #define DC_YAML_TRACE_LOG_DIR "trace_log_dir"
 #define DC_YAML_DATA_DIR "data_dir"
 #define DC_YAML_CAPTURE_PROBES "capture_probes"
@@ -184,16 +155,6 @@ ArgumentParser::ArgumentParser(int argc, char** argv) {
   }
 }
 
-/**
- * @brief ConfigurationManager constructor.
- *
- * Initializes the ConfigurationManager with command-line arguments, loads the
- * YAML configuration file, parses it, and sets up the necessary configurations.
- * Also derives and validates configurations.
- *
- * @param argc Number of command-line arguments
- * @param argv Array of command-line argument strings
- */
 ConfigurationManager::ConfigurationManager(int argc, char** argv, bool load_capture_probes,
                                            bool print)
     : config_file_path(),
@@ -203,7 +164,7 @@ ConfigurationManager::ConfigurationManager(int argc, char** argv, bool load_capt
       run_id("0") {
   struct rlimit rl;
   if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
-    rl.rlim_cur = rl.rlim_max;  // Set soft limit to hard limit
+    rl.rlim_cur = rl.rlim_max;
     if (setrlimit(RLIMIT_NOFILE, &rl) != 0) {
       DC_LOG_WARN("[ConfigurationManager] Failed to set ulimit -n to hard limit.");
     } else {
@@ -213,7 +174,7 @@ ConfigurationManager::ConfigurationManager(int argc, char** argv, bool load_capt
     DC_LOG_WARN("[ConfigurationManager] Failed to get current ulimit -n.");
   }
   if (getrlimit(RLIMIT_MEMLOCK, &rl) == 0) {
-    rl.rlim_cur = rl.rlim_max;  // Set soft limit to hard limit
+    rl.rlim_cur = rl.rlim_max;
     if (setrlimit(RLIMIT_MEMLOCK, &rl) != 0) {
       DC_LOG_WARN("[ConfigurationManager] Failed to set ulimit -l to hard limit.");
     } else {
@@ -222,9 +183,8 @@ ConfigurationManager::ConfigurationManager(int argc, char** argv, bool load_capt
   } else {
     DC_LOG_WARN("[ConfigurationManager] Failed to get current ulimit -l.");
   }
-  // Set ulimit -c (core file size) to its hard limit
   if (getrlimit(RLIMIT_CORE, &rl) == 0) {
-    rl.rlim_cur = rl.rlim_max;  // Set soft limit to hard limit
+    rl.rlim_cur = rl.rlim_max;
     if (setrlimit(RLIMIT_CORE, &rl) != 0) {
       DC_LOG_WARN("[ConfigurationManager] Failed to set ulimit -c to hard limit.");
     } else {
@@ -266,16 +226,13 @@ ConfigurationManager::ConfigurationManager(int argc, char** argv, bool load_capt
     throw std::runtime_error("Failed to load configuration file: " + config_file_path.string());
   }
 
-  // Parse YAML configuration if loaded successfully
   if (config) {
     DC_LOG_TRACE("[ConfigurationManager] Parsing configuration YAML...");
-    // Parse trace log directory from YAML
     if (config[DC_YAML_TRACE_LOG_DIR]) {
       this->trace_log_dir = config[DC_YAML_TRACE_LOG_DIR].as<std::string>();
       DC_LOG_DEBUG("[ConfigurationManager] Trace log dir set from config: %s",
                    this->trace_log_dir.string().c_str());
     }
-    // Parse data directory from YAML or use default
     if (config[DC_YAML_DATA_DIR]) {
       this->data_dir = config[DC_YAML_DATA_DIR].as<std::string>();
       DC_LOG_DEBUG("[ConfigurationManager] Data directory set from config: %s",
@@ -297,6 +254,23 @@ ConfigurationManager::ConfigurationManager(int argc, char** argv, bool load_capt
       } else {
         DC_LOG_TRACE("[ConfigurationManager] Parsing capture probes...");
         for (const auto& probe_node : config[DC_YAML_CAPTURE_PROBES]) {
+          // A client module is named, not probed: it is already wrapped in userspace, so the layer
+          // says which module and which calls rather than which mechanism.
+          if (probe_node["module"]) {
+            ClientLayer layer;
+            layer.module = probe_node["module"].as<std::string>();
+            layer.pattern = pattern_of(probe_node);
+            layer.is_regex = static_cast<bool>(probe_node["regex"]);
+            layer.aggregate = probe_node["aggregate"] ? probe_node["aggregate"].as<bool>() : false;
+            layer.off = probe_node["off"] ? probe_node["off"].as<bool>() : false;
+            for (const auto& g : probe_node["skip"]) layer.skip.push_back(g.as<std::string>());
+            if (!probe_node["name"]) {
+              throw std::invalid_argument("name is required for a client module layer.");
+            }
+            layer.name = probe_node["name"].as<std::string>();
+            this->client_layers.push_back(std::move(layer));
+            continue;
+          }
           if (probe_node["type"]) {
             CaptureType type;
             convert(probe_node["type"].as<std::string>(), type);
@@ -332,10 +306,9 @@ ConfigurationManager::ConfigurationManager(int argc, char** argv, bool load_capt
               }
               case CaptureType::KSYM: {
                 auto kernel_probe = std::make_shared<KernelCaptureProbe>();
-                if (probe_node["regex"]) {
-                  kernel_probe->regex = probe_node["regex"].as<std::string>();
-                } else {
-                  throw std::invalid_argument("Regex is required for KSYM capture type.");
+                kernel_probe->regex = pattern_of(probe_node);
+                if (kernel_probe->regex.empty()) {
+                  throw std::invalid_argument("regex or glob is required for KSYM capture type.");
                 }
                 probe = kernel_probe;
                 break;
@@ -350,6 +323,26 @@ ConfigurationManager::ConfigurationManager(int argc, char** argv, bool load_capt
                 usdt_probe->binary_path = probe_node["binary_path"].as<std::string>();
                 usdt_probe->provider = probe_node["provider"].as<std::string>();
                 probe = usdt_probe;
+                break;
+              }
+              case CaptureType::TRACEPOINT: {
+                auto tp_probe = std::make_shared<KernelCaptureProbe>(CaptureType::TRACEPOINT);
+                tp_probe->regex = pattern_of(probe_node);
+                if (tp_probe->regex.empty()) {
+                  throw std::invalid_argument(
+                      "regex or glob is required for TRACEPOINT capture type.");
+                }
+                probe = tp_probe;
+                break;
+              }
+              case CaptureType::PERF_EVENT: {
+                auto pe_probe = std::make_shared<KernelCaptureProbe>(CaptureType::PERF_EVENT);
+                pe_probe->regex = pattern_of(probe_node);
+                if (pe_probe->regex.empty()) {
+                  throw std::invalid_argument(
+                      "regex or glob is required for PERF_EVENT capture type.");
+                }
+                probe = pe_probe;
                 break;
               }
               case CaptureType::CUSTOM: {
@@ -382,15 +375,59 @@ ConfigurationManager::ConfigurationManager(int argc, char** argv, bool load_capt
             }
             convert(probe_node["probe"].as<std::string>(), probe->probe_type);
             probe->name = probe_node["name"].as<std::string>();
-            if (probe_node["regex"]) {
-              probe->regex = probe_node["regex"].as<std::string>();
+            if (const std::string pattern = pattern_of(probe_node); !pattern.empty()) {
+              probe->regex = pattern;
             }
+            if (probe_node["trace_event_type"]) {
+              probe->trace_event_type = probe_node["trace_event_type"].as<std::string>();
+            }
+            probe->system_wide =
+                probe_node["system_wide"] ? probe_node["system_wide"].as<bool>() : false;
+            probe->aggregate = probe_node["aggregate"] ? probe_node["aggregate"].as<bool>() : false;
+            probe->hot = probe_node["hot"] ? probe_node["hot"].as<bool>() : false;
+            probe->capture_stack =
+                probe_node["capture_stack"] ? probe_node["capture_stack"].as<bool>() : false;
+            probe->sample_freq =
+                probe_node["sample_freq"] ? probe_node["sample_freq"].as<unsigned int>() : 0;
+            probe->stack_dump_ratio = probe_node["stack_dump_ratio"]
+                                          ? probe_node["stack_dump_ratio"].as<unsigned int>()
+                                          : 0;
+            // Explicit per-function arg capture; overrides auto-discovery (DWARF for uprobes,
+            // tracefs for tracepoints).
+            if (probe_node["function_arguments"]) {
+              for (const auto& entry : probe_node["function_arguments"]) {
+                const auto fn = entry.first.as<std::string>();
+                std::vector<ProbeArgCaptureSpec> specs;
+                for (const auto& a : entry.second) {
+                  ProbeArgCaptureSpec spec;
+                  if (a["label"]) spec.label = a["label"].as<std::string>();
+                  if (a["c_type"]) spec.c_type = a["c_type"].as<std::string>();
+                  if (a["index"]) spec.index = a["index"].as<unsigned int>();
+                  if (a["offset"]) spec.offset = a["offset"].as<unsigned int>();
+                  if (a["num_bytes"]) spec.num_bytes = a["num_bytes"].as<unsigned int>();
+                  if (a["is_pointer"]) spec.is_pointer = a["is_pointer"].as<bool>();
+                  specs.push_back(std::move(spec));
+                }
+                if (!specs.empty()) probe->function_arguments[fn] = std::move(specs);
+              }
+            }
+            if (probe_node["gate_tid_arg"]) {
+              probe->gate_tid_arg = probe_node["gate_tid_arg"].as<std::string>();
+            }
+            probe->hot_exclude =
+                probe_node["hot_exclude_glob"]
+                    ? datacrumbs::utils::glob_to_regex(
+                          probe_node["hot_exclude_glob"].as<std::string>())
+                    : (probe_node["hot_exclude"] ? probe_node["hot_exclude"].as<std::string>()
+                                                 : "");
+            if (probe_node["hot_sensitive"])
+              for (const auto& s : probe_node["hot_sensitive"])
+                probe->hot_sensitive.push_back(s.as<std::string>());
             this->capture_probes.push_back(probe);
           }
         }
       }
     }
-    // Parse user from YAML or use default
     if (config[DC_YAML_USER]) {
       this->user = config[DC_YAML_USER].as<std::string>();
       DC_LOG_DEBUG("[ConfigurationManager] User set from config: %s", this->user.c_str());
@@ -400,20 +437,17 @@ ConfigurationManager::ConfigurationManager(int argc, char** argv, bool load_capt
           "default: %s",
           this->user.c_str());
     }
-    // Parse inclusion path from YAML
     if (config[DC_YAML_INCLUSION_PATH]) {
       this->inclusion_path = config[DC_YAML_INCLUSION_PATH].as<std::string>();
       this->inclusion_paths = this->inclusion_path;
       DC_LOG_DEBUG("[ConfigurationManager] Inclusion path set from config: %s",
                    this->inclusion_path.c_str());
     }
-    // Override run_id if provided as argument
     if (parser.run_id) {
       this->run_id = *parser.run_id;
       DC_LOG_DEBUG("[ConfigurationManager] Run ID overridden by argument: %s",
                    this->run_id.c_str());
     }
-    // Override config path if provided as argument
     if (parser.data_dir) {
       this->data_dir = absolute_normalized_path(*parser.data_dir);
       DC_LOG_DEBUG("[ConfigurationManager] Data directory overridden by argument: %s",
@@ -424,13 +458,11 @@ ConfigurationManager::ConfigurationManager(int argc, char** argv, bool load_capt
       DC_LOG_DEBUG("[ConfigurationManager] Probe file path overridden by argument: %s",
                    this->explicit_probe_file_path.string().c_str());
     }
-    // Override trace log dir if provided as argument
     if (parser.trace_log_dir) {
       this->trace_log_dir = absolute_normalized_path(*parser.trace_log_dir);
       DC_LOG_DEBUG("[ConfigurationManager] Trace log dir overridden by argument: %s",
                    parser.trace_log_dir->c_str());
     }
-    // Override user if provided as argument
     if (parser.user) {
       this->user = *parser.user;
       DC_LOG_DEBUG("[ConfigurationManager] User overridden by argument: %s", parser.user->c_str());
@@ -438,14 +470,12 @@ ConfigurationManager::ConfigurationManager(int argc, char** argv, bool load_capt
       DC_LOG_DEBUG("[ConfigurationManager] No user specified, using default: %s",
                    this->user.c_str());
     }
-    // Override inclusion path if provided as argument
     if (parser.inclusion_path) {
       this->inclusion_path = *parser.inclusion_path;
       this->inclusion_paths = this->inclusion_path;
       DC_LOG_DEBUG("[ConfigurationManager] Inclusion path overridden by argument: %s",
                    parser.inclusion_path->c_str());
     }
-    // Override log dir if provided as argument
     if (parser.log_dir) {
       this->log_dir = *parser.log_dir;
       DC_LOG_DEBUG("[ConfigurationManager] Log directory overridden by argument: %s",
@@ -459,7 +489,6 @@ ConfigurationManager::ConfigurationManager(int argc, char** argv, bool load_capt
     }
     this->disable_mpi = true;
   }
-  // Derive additional configuration values and validate
   derive_configurations();
   load_category_map();
   validate_configurations();
@@ -476,9 +505,9 @@ ConfigurationManager::ConfigurationManager(const std::filesystem::path& runtime_
       trace_log_dir(DATACRUMBS_LOG_DIR),
       capture_probes(),
       runtime_probes(),
-      user(env_or_default("DATACRUMBS_USER", env_or_default("USER", DATACRUMBS_INSTALL_USER))),
+      user(env_or_default(DATACRUMBS_ENV_USER, env_or_default("USER", DATACRUMBS_INSTALL_USER))),
       log_dir(DATACRUMBS_LOG_DIR),
-      run_id(env_or_default("DATACRUMBS_SERVER_RUN_ID", runtime_timestamp())),
+      run_id(env_or_default(DATACRUMBS_ENV_SERVER_RUN_ID, runtime_timestamp())),
       disable_mpi(true) {
   probe_file_path = absolute_normalized_path(runtime_probe_file);
   system_probe_path = DATACRUMBS_SYSTEM_PROBE_FILE;
@@ -495,7 +524,6 @@ ConfigurationManager::ConfigurationManager(const std::filesystem::path& runtime_
 }
 
 void ConfigurationManager::print_configurations() {
-  // Log final configuration for debugging
   DC_LOG_INFO("[ConfigurationManager] Final configuration:");
   DC_LOG_INFO("[ConfigurationManager] Capture probes loaded: %zu", this->capture_probes.size());
   DC_LOG_INFO("[ConfigurationManager] Category map loaded with %zu entries.", category_map.size());
@@ -531,18 +559,10 @@ void ConfigurationManager::print_configurations() {
   }
 }
 
-/**
- * @brief Derives additional configuration values based on current settings.
- *
- * This function generates file paths for trace files, probe files, exclusion
- * files, and category maps based on the hostname, process ID, timestamp, and
- * user.
- */
 void ConfigurationManager::derive_configurations() {
   DC_LOG_TRACE("[ConfigurationManager] Deriving configurations...");
   DC_LOG_DEBUG("[ConfigurationManager] Process ID: %d", getpid());
 
-  // Use this->hostname (std::string) instead of local char array
   std::string hostname;
   char hostname_buf[256] = {0};
   if (gethostname(hostname_buf, sizeof(hostname_buf) - 1) != 0) {
@@ -566,7 +586,6 @@ void ConfigurationManager::derive_configurations() {
 
   std::string lookup_file_suffix = std::string(DATACRUMBS_INSTALL_USER) + "-" + configuration_stem;
 
-  // Construct probe file name: probes-DATACRUMBS_INSTALL_USER-host.json
   std::string probe_file_name = "probes-" + lookup_file_suffix + ".json.gz";
   this->probe_file_path = this->data_dir / probe_file_name;
   if (!this->explicit_probe_file_path.empty()) {
@@ -576,32 +595,24 @@ void ConfigurationManager::derive_configurations() {
   DC_LOG_DEBUG("[ConfigurationManager] Probe file path: %s",
                this->probe_file_path.string().c_str());
 
-  // Construct probe exclusion file name:
-  // probes-exclusion-DATACRUMBS_INSTALL_USER-host.json
   std::string probe_exclusion_file_name = "probes-exclusion-" + lookup_file_suffix + ".json";
   this->probe_exclusion_file_path = this->data_dir / probe_exclusion_file_name;
   this->probe_exclusion_file_path = absolute_normalized_path(this->probe_exclusion_file_path);
   DC_LOG_DEBUG("[ConfigurationManager] Probe exclusion file path: %s",
                this->probe_exclusion_file_path.string().c_str());
 
-  // Construct probe invalid file name:
-  // probes-invalid-DATACRUMBS_INSTALL_USER-host.json
   std::string probe_invalid_file_name = "probes-invalid-" + lookup_file_suffix + ".json";
   this->probe_invalid_file_path = this->data_dir / probe_invalid_file_name;
   this->probe_invalid_file_path = absolute_normalized_path(this->probe_invalid_file_path);
   DC_LOG_DEBUG("[ConfigurationManager] Probe invalid path: %s",
                this->probe_invalid_file_path.string().c_str());
 
-  // Construct categories file name:
-  // categories-DATACRUMBS_INSTALL_USER-host.json
   std::string categories_file_name = "categories-" + lookup_file_suffix + ".json";
   this->category_map_path = this->data_dir / categories_file_name;
   this->category_map_path = absolute_normalized_path(this->category_map_path);
   DC_LOG_DEBUG("[ConfigurationManager] Category map path: %s",
                this->category_map_path.string().c_str());
 
-  // Construct manual probe file name:
-  // manual-probes-DATACRUMBS_INSTALL_USER-host.json
   std::string manual_probe_file_name = "manual-probes-" + lookup_file_suffix + ".json";
   this->manual_probe_path = this->data_dir / manual_probe_file_name;
   this->manual_probe_path = absolute_normalized_path(this->manual_probe_path);
@@ -615,12 +626,6 @@ void ConfigurationManager::derive_configurations() {
                this->system_probe_path.string().c_str());
 }
 
-/**
- * @brief Validates the loaded and derived configuration values.
- *
- * Checks for the presence of capture probes and the existence of required
- * directories. Throws exceptions if validation fails.
- */
 void ConfigurationManager::load_category_map() {
   std::string category_json_path = category_map_path.string();
   if (category_json_path.empty() || !std::filesystem::exists(category_json_path)) {
@@ -661,31 +666,6 @@ void ConfigurationManager::load_category_map() {
     }
   }
   json_object_put(root);
-}
-
-void ConfigurationManager::load_runtime_system_configuration() {
-  if (std::getenv("DATACRUMBS_USER") != nullptr) {
-    user = std::getenv("DATACRUMBS_USER");
-  }
-  if (std::getenv("DATACRUMBS_LOG_DIR") != nullptr) {
-    log_dir = std::getenv("DATACRUMBS_LOG_DIR");
-  }
-  if (std::getenv("DATACRUMBS_INSTALL_DATA_DIR") != nullptr) {
-    data_dir = std::getenv("DATACRUMBS_INSTALL_DATA_DIR");
-  }
-  if (std::getenv("DATACRUMBS_CONFIGURED_TRACE_DIR") != nullptr) {
-    trace_log_dir = std::getenv("DATACRUMBS_CONFIGURED_TRACE_DIR");
-  }
-
-  if (trace_log_dir.empty()) {
-    trace_log_dir = DATACRUMBS_CONFIGURED_TRACE_DIR;
-  }
-  if (log_dir.empty()) {
-    log_dir = DATACRUMBS_LOG_DIR;
-  }
-  if (data_dir.empty()) {
-    data_dir = DATACRUMBS_INSTALL_DATA_DIR;
-  }
 }
 
 void ConfigurationManager::load_runtime_probe_file() {

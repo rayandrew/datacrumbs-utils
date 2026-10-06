@@ -1,1 +1,6 @@
 add_subdirectory(io_tests)
+add_subdirectory(timesync)
+add_subdirectory(doca)
+if(DATACRUMBS_UTILS_ENABLE_GOTCHA)
+  add_subdirectory(wrap)
+endif()

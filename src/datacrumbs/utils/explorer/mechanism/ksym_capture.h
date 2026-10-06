@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: MIT
-// Owner: hariharandev1@llnl.gov
 
 #pragma once
 // include first
@@ -17,27 +16,16 @@
 namespace datacrumbs {
 
 /**
- * @brief Class to capture and filter kernel symbol function names from
- * /proc/kallsyms.
+ * @brief Captures and filters kernel symbol function names from /proc/kallsyms.
  */
 class KSymCapture {
  public:
-  /**
-   * @brief Constructor that loads function symbols from the given kallsyms
-   * path.
-   * @param kallsyms_path Path to the kallsyms file (default: "/proc/kallsyms").
-   */
   KSymCapture(const std::string& kallsyms_path = "/proc/kallsyms") {
     DC_LOG_TRACE("KSymCapture: Start loading functions from %s", kallsyms_path.c_str());
     loadFunctions(kallsyms_path);
     DC_LOG_TRACE("KSymCapture: Finished loading functions from %s", kallsyms_path.c_str());
   }
 
-  /**
-   * @brief Returns a list of function names matching the given regex pattern.
-   * @param pattern Regular expression pattern to match function names.
-   * @return Vector of matching function names.
-   */
   std::vector<std::string> getFunctionsByRegex(const std::string& pattern) const {
     DC_LOG_TRACE("KSymCapture: Start getFunctionsByRegex with pattern: %s", pattern.c_str());
     std::vector<std::string> result;
@@ -52,15 +40,9 @@ class KSymCapture {
     DC_LOG_TRACE("KSymCapture: End getFunctionsByRegex");
     return result;
   }
-  /// In-memory set of kernel text symbols loaded from kallsyms.
   std::unordered_set<std::string> functions_;
 
  private:
-  /**
-   * @brief Loads function symbols from the specified kallsyms file.
-   *        Only symbols of type 'T' or 't' are considered functions.
-   * @param path Path to the kallsyms file.
-   */
   void loadFunctions(const std::string& path) {
     DC_LOG_TRACE("KSymCapture: Enter loadFunctions with path: %s", path.c_str());
     std::ifstream file(path);
@@ -74,7 +56,6 @@ class KSymCapture {
       std::istringstream iss(line);
       std::string addr, type, name;
       if (!(iss >> addr >> type >> name)) continue;
-      // Only add functions (type 'T' or 't')
       if (type == "T" || type == "t") {
         functions_.insert(name);
         ++count;

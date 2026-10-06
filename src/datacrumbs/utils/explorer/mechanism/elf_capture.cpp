@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: MIT
-// Owner: hariharandev1@llnl.gov
 
 #include <datacrumbs/utils/explorer/mechanism/elf_capture.h>
 
@@ -78,9 +77,7 @@ std::vector<std::string> ElfSymbolExtractor::extract_symbols() {
 
   const Elf64_Ehdr* ehdr = reinterpret_cast<const Elf64_Ehdr*>(data_);
   const Elf64_Shdr* shdrs = reinterpret_cast<const Elf64_Shdr*>(data_ + ehdr->e_shoff);
-  const char* shstrtab = reinterpret_cast<const char*>(data_ + shdrs[ehdr->e_shstrndx].sh_offset);
 
-  // First pass: count symbol occurrences
   for (int i = 0; i < ehdr->e_shnum; ++i) {
     if (shdrs[i].sh_type == SHT_SYMTAB || shdrs[i].sh_type == SHT_DYNSYM) {
       const Elf64_Sym* syms = reinterpret_cast<const Elf64_Sym*>(data_ + shdrs[i].sh_offset);
@@ -89,7 +86,6 @@ std::vector<std::string> ElfSymbolExtractor::extract_symbols() {
 
       for (size_t j = 0; j < num_syms; ++j) {
         if (syms[j].st_shndx == SHN_UNDEF) continue;
-        // if (ELF64_ST_BIND(syms[j].st_info) == STB_LOCAL) continue;
         if (ELF64_ST_TYPE(syms[j].st_info) != STT_FUNC) continue;
 
         std::string name = std::string(strtab + syms[j].st_name);
@@ -125,7 +121,6 @@ std::vector<std::string> ElfSymbolExtractor::extract_symbols() {
 
   std::vector<std::string> symbols;
   for (const auto& pair : symbols_map) {
-    // Skip if symbol is in kExcludedFunctions
     if (kExcludedFunctions.find(pair.first) != kExcludedFunctions.end()) {
       continue;
     }

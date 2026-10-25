@@ -147,6 +147,9 @@ gotcha_wrappee_handle_t g_h_obj_create;
 gotcha_wrappee_handle_t g_h_obj_modify;
 gotcha_wrappee_handle_t g_h_task_submit;
 gotcha_wrappee_handle_t g_h_pe_progress;
+gotcha_wrappee_handle_t g_h_obj_destroy;
+gotcha_wrappee_handle_t g_h_proc_create;
+gotcha_wrappee_handle_t g_h_proc_destroy;
 
 // Slots are claimed and released rather than appended, so a long run reuses them instead of
 // walking off the end. kState* is the publication protocol: a reader may only trust a slot's
@@ -154,6 +157,8 @@ gotcha_wrappee_handle_t g_h_pe_progress;
 constexpr int kStateFree = 0;
 constexpr int kStateClaimed = 1;
 constexpr int kStateReady = 2;
+/// A DPA CQ whose owner is going away: no longer read, freed by the next sweep.
+constexpr int kStateDying = 3;
 
 // Physical positions a 256 KB region (the cap scan_wqe enforces below) can hold, one 64-byte slot
 // each. This is a byte-size bound, unrelated to the value a wqe_counter can carry: it sizes the
@@ -209,8 +214,43 @@ struct Cq {
   struct mlx5dv_clock_info clock {};
   uint64_t clock_at = 0;
   bool convert = false;
+  /// A DPA-native CQ lives in the DPA heap, which the host cannot address: each sweep copies the
+  /// ring from daddr into buf (host memory owned here) through the FlexIO process, then reads buf.
+  void* dpa_proc = nullptr;
+  uint64_t daddr = 0;
+  /// The CQ's DevX object, so its destroy frees the slot before the DPA heap is reused.
+  void* obj = nullptr;
+  /// The host copy's allocation, apart from buf, which drain clears on a resize.
+  unsigned char* dpa_buf = nullptr;
+  unsigned dpa_copy_fails = 0;
 };
 Cq g_cq[kMaxCq];
+
+/// A FlexIO process seen at flexio_process_create: its heap umem id names the CQs that live in DPA
+/// memory, and heap base + the CQ's umem offset is where each ring starts.
+struct DpaProc {
+  std::atomic<int> state{kStateFree};
+  void* proc;
+  void* ctx;
+  uint32_t dumem_id;
+  uint64_t heap_base;
+  uint64_t heap_size;
+};
+constexpr int kMaxDpaProc = 8;
+DpaProc g_dpa_proc[kMaxDpaProc];
+/// The FlexIO calls the copy needs, resolved when the first process appears: a process that links
+/// no FlexIO never pays for the lookup and the client does not depend on the library.
+struct FlexioMem {
+  uint32_t mem_type;  // enum flexio_memtype: 0 DPA, 1 host
+  uint64_t addr;      // daddr or haddr, the union in struct flexio_mem
+};
+using FlexioMemcpyFn = int (*)(void*, FlexioMem*, FlexioMem*, size_t);
+std::atomic<FlexioMemcpyFn> g_flexio_memcpy{nullptr};
+std::atomic<uint64_t> g_dpa_cq{0};
+std::atomic<uint64_t> g_dpa_copy_fail{0};
+/// CREATE_CQs that looked like DPA CQs and were not bound: an ambiguous process, or a ring that
+/// does not fit the heap.
+std::atomic<uint64_t> g_dpa_unbound{0};
 
 // What a submit asked the engine to do, from the work-queue entry it wrote. A completion cannot
 // answer this: compress, DMA and AES all land as one requester completion. Work goes out as
@@ -611,6 +651,8 @@ struct RawCqe {
   uint64_t dev_ns;  // the stamp in its own device's PHC time; 0 when the daemon's fit applies
   uint8_t cq_idx;
   uint8_t err;  // error completion: its timestamp field is not a clock reading
+  // Set when read: the slot can be freed, and reused by a host CQ, before this is formatted.
+  uint8_t dpa;
 
   uint64_t hw_ns() const { return err ? 0 : be64_at(cqe + kTsOffset); }
   uint32_t byte_cnt() const { return be32_at(cqe + kByteCntOffset); }
@@ -725,6 +767,7 @@ void capture(const unsigned char* e, int cq_idx, bool err, uint64_t now_ns, uint
   r.dev_ns = dev_ns;
   r.cq_idx = static_cast<uint8_t>(cq_idx);
   r.err = err ? 1 : 0;
+  r.dpa = g_cq[cq_idx].dpa_proc != nullptr ? 1 : 0;
   if (!g_ring.push(r)) g_ring_dropped.fetch_add(1, std::memory_order_relaxed);
   if (stats) {
     g_capture_calls.fetch_add(1, std::memory_order_relaxed);
@@ -772,7 +815,10 @@ void emit_from_raw(const RawCqe& r) {
   bool joined = false;
   // AGGREGATE mode never populates the pending table (sweep_tick skips the walk there), so a
   // lookup would only ever miss; skip it rather than pay an atomic exchange for a guaranteed no.
-  const bool join_is_on = capture_mode() == EngineCaptureMode::RECORDS && join_enabled();
+  // A DPA CQ's submits are DPA-side writes this reader never walks, so a lookup could only miss.
+  const bool dpa = r.dpa != 0;
+  const bool join_is_on =
+      !dpa && capture_mode() == EngineCaptureMode::RECORDS && join_enabled();
   if (join_is_on && take_pending(qpn, wqe_counter, &req)) {
     joined = true;
     g_joined_any.store(true, std::memory_order_relaxed);
@@ -789,7 +835,9 @@ void emit_from_raw(const RawCqe& r) {
   // matched: the submit was found. startup: posted before this process attached, so there was
   // never a submit to find. missed: the scanner should have seen it and did not.
   const char* join_state =
-      joined ? "matched" : (g_joined_any.load(std::memory_order_relaxed) ? "missed" : "startup");
+      dpa ? "none"
+          : joined ? "matched"
+                   : (g_joined_any.load(std::memory_order_relaxed) ? "missed" : "startup");
   if (capture_mode() == EngineCaptureMode::AGGREGATE) {
     // Tally first: DATACRUMBS_ENGINE_SAMPLE names every Nth completion, not every Nth that
     // happens to also be joined, so the sample decision must run whether or not the tally
@@ -882,7 +930,7 @@ void emit_from_raw(const RawCqe& r) {
       // did not: COMPLETE with a zero duration would draw as a zero-width box and hide the
       // difference between instantaneous and unknown.
       R"({"id":%llu,"name":"%s","cat":")" DC_CAT R"(","type":")" DC_TYPE
-      R"(","pid":%ld,"tid":%d,"ts":%llu,"dur":%llu,"ph":%u,"args":{"hhash":"%s","cqe.clock":"%s","cqe.phc":%d,"cqe.bytes":%u,"cqe.imm":%u,"cqe.opcode":%u,"cqe.class":"%s","cqe.cq":%d,"engine.op":"%s","engine.src_len":%llu,"engine.dst_len":%llu,"cqe.submit_delta_ns":%lld,"cqe.hw_ns":%llu,"cqe.join":"%s","mlx5.opcode":"%s","mlx5.opcode_raw":%u,"cqe.qpn":%u,"cqe.sop":%u,"tool":"engine_hwts"}})"
+      R"(","pid":%ld,"tid":%d,"ts":%llu,"dur":%llu,"ph":%u,"args":{"hhash":"%s","cqe.clock":"%s","cqe.phc":%d,"cqe.bytes":%u,"cqe.imm":%u,"cqe.opcode":%u,"cqe.class":"%s","cqe.cq":%d,"engine.op":"%s","engine.src_len":%llu,"engine.dst_len":%llu,"cqe.submit_delta_ns":%lld,"cqe.hw_ns":%llu,"cqe.join":"%s","mlx5.opcode":"%s","mlx5.opcode_raw":%u,"cqe.qpn":%u,"cqe.sop":%u,"cqe.dpa":%d,"tool":"engine_hwts"}})"
       "\n",
       static_cast<unsigned long long>(s->next_id()), record_name,
       static_cast<long>(datacrumbs::client::self_pid()), static_cast<int>(tid()),
@@ -891,7 +939,7 @@ void emit_from_raw(const RawCqe& r) {
       r.imm(), opcode, klass, cq_idx, namebuf, static_cast<unsigned long long>(req.src_len),
       static_cast<unsigned long long>(req.dst_len), submit_delta,
       static_cast<unsigned long long>(ref), join_state, opcode_name, opcode_raw, qpn,
-      static_cast<unsigned>(r.sop()));
+      static_cast<unsigned>(r.sop()), dpa ? 1 : 0);
   if (n > 0) {
     s->write(line, static_cast<std::size_t>(n));
     g_emitted.fetch_add(1, std::memory_order_relaxed);
@@ -1028,6 +1076,30 @@ size_t drain(Cq& cq, int idx) {
   return read;
 }
 
+/// Refresh a DPA CQ's host copy of its ring. In pieces: a DPA-to-host copy past 64 KB returns
+/// success with the tail missing.
+bool copy_dpa_ring(Cq& cq) {
+  constexpr size_t kPiece = 32 * 1024;
+  FlexioMemcpyFn copy = g_flexio_memcpy.load(std::memory_order_acquire);
+  if (copy == nullptr) return false;
+  const size_t bytes = cq.entries * kCqeSize;
+  for (size_t at = 0; at < bytes; at += kPiece) {
+    FlexioMem src{0, cq.daddr + at};
+    FlexioMem dst{1, reinterpret_cast<uint64_t>(cq.buf + at)};
+    if (copy(cq.dpa_proc, &src, &dst, bytes - at < kPiece ? bytes - at : kPiece) != 0) {
+      g_dpa_copy_fail.fetch_add(1, std::memory_order_relaxed);
+      // Not a ring this process can read after all: stop paying a failed copy every tick.
+      if (++cq.dpa_copy_fails >= 16) {
+        int expect = kStateReady;
+        cq.state.compare_exchange_strong(expect, kStateDying, std::memory_order_acq_rel);
+      }
+      return false;
+    }
+  }
+  cq.dpa_copy_fails = 0;
+  return true;
+}
+
 /// Sweep every ready CQ once. A sweep that finds the dereg hook mid-drain skips this tick; the
 /// next one picks up whatever is left.
 size_t sweep_all_cqs() {
@@ -1037,8 +1109,23 @@ size_t sweep_all_cqs() {
   }
   size_t read = 0;
   for (int i = 0; i < kMaxCq; ++i) {
+    if (g_cq[i].state.load(std::memory_order_acquire) == kStateDying) {
+      std::free(g_cq[i].dpa_buf);
+      g_cq[i].dpa_buf = nullptr;
+      g_cq[i].buf = nullptr;
+      g_cq[i].dpa_proc = nullptr;
+      g_cq[i].obj = nullptr;
+      g_cq[i].state.store(kStateFree, std::memory_order_release);
+      continue;
+    }
     if (g_cq[i].state.load(std::memory_order_acquire) != kStateReady) continue;
     if (g_cq[i].buf == nullptr) continue;
+    if (g_cq[i].dpa_proc != nullptr) {
+      // Retired mid-copy: the ring may already be another object's memory.
+      if (!copy_dpa_ring(g_cq[i]) ||
+          g_cq[i].state.load(std::memory_order_acquire) != kStateReady)
+        continue;
+    }
     read += drain(g_cq[i], i);
   }
   g_ring_pushing.clear(std::memory_order_release);
@@ -1123,7 +1210,9 @@ void emit_health() {
       R"("health.cq_at_offset":%llu,"health.join_miss":%llu,"health.join_overwrite":%llu,)"
       R"("health.max_scan_gap_ns":%llu,"health.submit_unknown":%llu,)"
       R"("health.lapped_resync":%llu,"health.lapped_delta":%llu,)"
-      R"("health.walk_skipped":%llu,"health.cq_sweep_skipped":%llu,"tool":"engine_hwts"}})"
+      R"("health.walk_skipped":%llu,"health.cq_sweep_skipped":%llu,)"
+      R"("health.dpa_cq":%llu,"health.dpa_copy_fail":%llu,"health.dpa_unbound":%llu,)"
+      R"("tool":"engine_hwts"}})"
       "\n",
       static_cast<unsigned long long>(s->next_id()),
       static_cast<long>(datacrumbs::client::self_pid()), static_cast<int>(tid()),
@@ -1142,7 +1231,10 @@ void emit_health() {
       static_cast<unsigned long long>(g_lapped_resync.load()),
       static_cast<unsigned long long>(g_lapped_delta.load()),
       static_cast<unsigned long long>(g_walk_skipped.load()),
-      static_cast<unsigned long long>(g_cq_sweep_skipped.load()));
+      static_cast<unsigned long long>(g_cq_sweep_skipped.load()),
+      static_cast<unsigned long long>(g_dpa_cq.load()),
+      static_cast<unsigned long long>(g_dpa_copy_fail.load()),
+      static_cast<unsigned long long>(g_dpa_unbound.load()));
   if (n > 0) s->write(line, static_cast<std::size_t>(n));
 }
 
@@ -1287,6 +1379,141 @@ void* umem_reg_ex_wrap(void* ctx, void* in) {
   return r;
 }
 
+namespace {
+/// Bind a CREATE_CQ whose umem is a FlexIO process's DPA heap. Returns false when it is not one,
+/// so the host-memory path below handles it.
+bool bind_dpa_cq(void* ctx, const uint8_t* cmd, uint32_t umem_id, void* obj) {
+  if (obj == nullptr) return false;
+  // Called only for a CQ whose umem matched no host registration. DOCA creates a DPA CQ on an
+  // extended context of the process, where the heap has another umem id than the process reports,
+  // so the heap id only picks between processes; with one process, that process owns the CQ.
+  const DpaProc* p = nullptr;
+  int live = 0;
+  for (int i = 0; i < kMaxDpaProc; ++i) {
+    if (g_dpa_proc[i].state.load(std::memory_order_acquire) != kStateReady) continue;
+    ++live;
+    if (p == nullptr || g_dpa_proc[i].dumem_id == umem_id) p = &g_dpa_proc[i];
+  }
+  if (p == nullptr) return false;
+  const size_t entries = size_t{1} << (cmd[kCqcLogSizeOffset] & kCqcLogSizeMask);
+  const uint64_t off = be64_at(cmd + kCqUmemOffsetOffset);
+  // A host CQ whose registration was never seen also lands here; a ring outside the heap is one.
+  if ((live > 1 && p->dumem_id != umem_id) || off + entries * kCqeSize > p->heap_size) {
+    g_dpa_unbound.fetch_add(1, std::memory_order_relaxed);
+    if (stats_enabled())
+      DC_LOG_INFO("[doca_engine] cq not bound: umem %u, %zu entries at offset 0x%llx, %d processes",
+                  umem_id, entries, static_cast<unsigned long long>(off), live);
+    return true;
+  }
+  auto* buf = static_cast<unsigned char*>(std::calloc(entries, kCqeSize));
+  if (buf == nullptr) return true;
+  for (int c = 0; c < kMaxCq; ++c) {
+    int expect = kStateFree;
+    if (!g_cq[c].state.compare_exchange_strong(expect, kStateClaimed, std::memory_order_acquire))
+      continue;
+    g_cq[c].entries = entries;
+    g_cq[c].buf = buf;
+    g_cq[c].ci = 0;
+    g_cq[c].ctr[0] = g_cq[c].ctr[1] = Cq::CtrTrack{};
+    g_cq[c].umem_id = umem_id;
+    g_cq[c].phc = phc_of_context(static_cast<struct ibv_context*>(ctx));
+    g_cq[c].ctx = static_cast<struct ibv_context*>(ctx);
+    g_cq[c].clock_at = 0;
+    g_cq[c].convert = false;
+    g_cq[c].dpa_proc = p->proc;
+    g_cq[c].daddr = p->heap_base + off;
+    g_cq[c].dpa_buf = buf;
+    g_cq[c].dpa_copy_fails = 0;
+    g_cq[c].obj = obj;
+    g_cq[c].state.store(kStateReady, std::memory_order_release);
+    g_dpa_cq.fetch_add(1, std::memory_order_relaxed);
+    if (stats_enabled())
+      DC_LOG_INFO("[doca_engine] dpa cq %d: %zu entries at daddr 0x%llx", c, entries,
+                  static_cast<unsigned long long>(g_cq[c].daddr));
+    return true;
+  }
+  std::free(buf);
+  g_dropped_cq.fetch_add(1, std::memory_order_relaxed);
+  return true;
+}
+
+/// Stop reading the DPA CQs @p match selects. The sweep frees them: waiting here for its flag can
+/// deadlock, since a copy in flight may wait on a FlexIO lock the destroying caller holds. No last
+/// copy either: one made while DOCA tears the process down failed and hung the program.
+template <typename Match>
+void retire_dpa_cqs(Match match) {
+  for (int c = 0; c < kMaxCq; ++c) {
+    if (g_cq[c].dpa_proc == nullptr || !match(g_cq[c])) continue;
+    int expect = kStateReady;
+    g_cq[c].state.compare_exchange_strong(expect, kStateDying, std::memory_order_acq_rel);
+  }
+}
+}  // namespace
+
+int obj_destroy_wrap(void* obj) {
+  auto real = reinterpret_cast<int (*)(void*)>(gotcha_get_wrappee(g_h_obj_destroy));
+  if (real == nullptr) return -1;
+  if (enabled() && g_dpa_cq.load(std::memory_order_relaxed) != 0)
+    retire_dpa_cqs([obj](const Cq& cq) { return cq.obj == obj; });
+  return real(obj);
+}
+
+// flexio_process_create(ibv_ctx, app, attr, process_out). The heap's umem id and base come from
+// the process itself, and the ibv context is what the CQs it backs are created on.
+int proc_create_wrap(void* ibv_ctx, void* app, const void* attr, void** out) {
+  auto real = reinterpret_cast<int (*)(void*, void*, const void*, void**)>(
+      gotcha_get_wrappee(g_h_proc_create));
+  if (real == nullptr) return -1;
+  const int rc = real(ibv_ctx, app, attr, out);
+  if (rc != 0 || out == nullptr || *out == nullptr || !enabled() || tracer_thread_active())
+    return rc;
+  auto dumem = reinterpret_cast<uint32_t (*)(void*)>(dlsym(RTLD_DEFAULT,
+                                                           "flexio_process_get_dumem_id"));
+  // struct flexio_heap_mem_info leads with uint64_t base_addr.
+  auto info = reinterpret_cast<int (*)(const void*, void*)>(dlsym(RTLD_DEFAULT,
+                                                                  "flexio_process_mem_info_get"));
+  auto copy = reinterpret_cast<FlexioMemcpyFn>(dlsym(RTLD_DEFAULT, "flexio_memcpy"));
+  uint64_t heap[4] = {};
+  if (dumem == nullptr || info == nullptr || copy == nullptr || info(*out, heap) != 0) {
+    DC_LOG_WARN("[doca_engine] flexio process %p: no heap info, its DPA CQs are not read", *out);
+    return rc;
+  }
+  g_flexio_memcpy.store(copy, std::memory_order_release);
+  for (int i = 0; i < kMaxDpaProc; ++i) {
+    int expect = kStateFree;
+    if (!g_dpa_proc[i].state.compare_exchange_strong(expect, kStateClaimed,
+                                                     std::memory_order_acquire))
+      continue;
+    g_dpa_proc[i].proc = *out;
+    g_dpa_proc[i].ctx = ibv_ctx;
+    g_dpa_proc[i].dumem_id = dumem(*out);
+    g_dpa_proc[i].heap_base = heap[0];
+    g_dpa_proc[i].heap_size = heap[1];
+    g_dpa_proc[i].state.store(kStateReady, std::memory_order_release);
+    if (stats_enabled())
+      DC_LOG_INFO("[doca_engine] flexio process %p: heap umem %u at 0x%llx", *out,
+                  g_dpa_proc[i].dumem_id, static_cast<unsigned long long>(heap[0]));
+    return rc;
+  }
+  return rc;
+}
+
+int proc_destroy_wrap(void* proc) {
+  auto real = reinterpret_cast<int (*)(void*)>(gotcha_get_wrappee(g_h_proc_destroy));
+  if (real == nullptr) return -1;
+  retire_dpa_cqs([proc](const Cq& cq) { return cq.dpa_proc == proc; });
+  // A copy already in flight still uses the process. Nothing FlexIO owns is held yet at this
+  // point, so waiting for the sweep's flag cannot deadlock here.
+  while (g_ring_pushing.test_and_set(std::memory_order_acquire)) {
+  }
+  g_ring_pushing.clear(std::memory_order_release);
+  for (int i = 0; i < kMaxDpaProc; ++i)
+    if (g_dpa_proc[i].state.load(std::memory_order_acquire) == kStateReady &&
+        g_dpa_proc[i].proc == proc)
+      g_dpa_proc[i].state.store(kStateFree, std::memory_order_release);
+  return real(proc);
+}
+
 void* obj_create_wrap(void* ctx, const void* in, size_t inlen, void* out, size_t outlen) {
   auto real = reinterpret_cast<void* (*)(void*, const void*, size_t, void*, size_t)>(
       gotcha_get_wrappee(g_h_obj_create));
@@ -1366,6 +1593,7 @@ void* obj_create_wrap(void* ctx, const void* in, size_t inlen, void* out, size_t
     g_dropped_cq.fetch_add(1, std::memory_order_relaxed);
     return r;
   }
+  bind_dpa_cq(ctx, cmd, want, r);
   return r;
 }
 
@@ -1384,7 +1612,8 @@ int umem_dereg_wrap(void* umem) {
     }
     for (int c = 0; c < kMaxCq; ++c) {
       if (g_cq[c].state.load(std::memory_order_acquire) != kStateReady) continue;
-      if (g_cq[c].umem_id != g_umem[i].id) continue;
+      // A DPA CQ's umem is the DPA heap, not this host registration, even when the ids agree.
+      if (g_cq[c].dpa_proc != nullptr || g_cq[c].umem_id != g_umem[i].id) continue;
       // A CQ that lives and dies inside one drain tick would otherwise lose every completion it
       // ever posted: catch it here, at the one point that is guaranteed to run before the memory
       // goes away, rather than depend on winning a race against the timer thread's next wakeup.
@@ -1594,6 +1823,9 @@ void datacrumbs::client::doca::init() {
       {"mlx5dv_devx_obj_modify", reinterpret_cast<void*>(obj_modify_wrap), &g_h_obj_modify},
       {"doca_task_submit", reinterpret_cast<void*>(task_submit_wrap), &g_h_task_submit},
       {"doca_pe_progress", reinterpret_cast<void*>(pe_progress_wrap), &g_h_pe_progress},
+      {"mlx5dv_devx_obj_destroy", reinterpret_cast<void*>(obj_destroy_wrap), &g_h_obj_destroy},
+      {"flexio_process_create", reinterpret_cast<void*>(proc_create_wrap), &g_h_proc_create},
+      {"flexio_process_destroy", reinterpret_cast<void*>(proc_destroy_wrap), &g_h_proc_destroy},
   };
   // Interposing a symbol a kernel-bypass path uses can break that path outright, so the set is
   // selectable: DATACRUMBS_ENGINE_WRAPS names the symbols to wrap and empty means all of them.

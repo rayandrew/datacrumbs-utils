@@ -24,12 +24,14 @@
 #include <sys/mman.h>
 #include <yaml-cpp/yaml.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -130,6 +132,11 @@ gotcha_binding_t g_bindings[] = {DC_WRAPPED_FUNCS(DC_GOTCHA_BINDING)};
 // Parallel to g_bindings: same order, same length.
 const char* g_classes[] = {DC_WRAPPED_FUNCS(DC_GOTCHA_CLASS)};
 
+// The selection's exclude globs, for the trampolined symbols that no binding table holds. Set
+// once in init before the sink exists, so no trampoline can resolve a mode before it is read.
+// Leaked: a program's own exit path still calls trampolined symbols after static destructors.
+std::atomic<const std::vector<std::string>*> g_tramp_exclude{nullptr};
+
 /// Bindings named by the selection at @p path, or all of them if it selects nothing.
 /// `include` defaults to everything and runs first; `exclude` runs after and wins.
 /// `classes` matches the role recorded in the wrap list, so a selection can say
@@ -163,6 +170,7 @@ std::vector<gotcha_binding_t> select_bindings(const char* path, int n) {
       if (fnmatch(p.c_str(), name, 0) == 0) want = false;
     if (want) out.push_back(g_bindings[i]);
   }
+  g_tramp_exclude.store(new std::vector<std::string>(std::move(exclude)), std::memory_order_release);
   return out;
 }
 
@@ -175,14 +183,16 @@ void datacrumbs::client::wrap::init() {
   if (ran) return;
   ran = true;
   if (!enabled()) return;
-  std::call_once(g_once, [] { datacrumbs::Singleton<ApiSink>::get_instance(); });
-  check_version();
   const int all = static_cast<int>(sizeof(g_bindings) / sizeof(g_bindings[0]));
   const std::string& api_cfg = datacrumbs::ConfigurationManager::runtime().api_config;
   const char* cfg = api_cfg.empty() ? nullptr : api_cfg.c_str();
   // Leaked: GOTCHA keeps the table, and reads it past static destruction.
   static auto* chosen = new std::vector<gotcha_binding_t>();
+  // Before the sink: a trampoline records nothing until the sink exists, and by then the
+  // exclude list it checks is in place.
   if (cfg != nullptr) *chosen = select_bindings(cfg, all);
+  std::call_once(g_once, [] { datacrumbs::Singleton<ApiSink>::get_instance(); });
+  check_version();
   const int n = cfg != nullptr ? static_cast<int>(chosen->size()) : all;
   gotcha_binding_t* table = cfg != nullptr ? chosen->data() : g_bindings;
   if (cfg != nullptr) DC_LOG_INFO("[api] %s selects %d of %d", cfg, n, all);
@@ -273,7 +283,12 @@ datacrumbs::ConfigurationManager::CaptureMode tramp_mode(const char* name) {
     const auto it = modes->find(name);
     if (it != modes->end()) return it->second;
   }
-  const auto mode = datacrumbs::client::gotcha_wrap::mode_of(name);
+  auto mode = datacrumbs::client::gotcha_wrap::mode_of(name);
+  // An excluded symbol is a spin loop the selection keeps out; a trampoline cannot be unbound,
+  // so it is forwarded with no frame.
+  if (const auto* ex = g_tramp_exclude.load(std::memory_order_acquire); ex != nullptr)
+    for (const auto& p : *ex)
+      if (fnmatch(p.c_str(), name, 0) == 0) mode = datacrumbs::ConfigurationManager::CaptureMode::OFF;
   std::unique_lock<std::shared_mutex> w(*lock);
   modes->emplace(name, mode);
   return mode;

@@ -171,6 +171,7 @@ void ConfigurationManager::load_runtime_system_configuration() {
   engine_join_enabled = setting_flag_default_on(DATACRUMBS_ENV_ENGINE_JOIN);
   engine_scan_cache_enabled = setting_flag_default_on(DATACRUMBS_ENV_ENGINE_SCAN_CACHE);
   engine_skip_idle_enabled = setting_flag_default_on(DATACRUMBS_ENV_ENGINE_SKIP_IDLE);
+  engine_doorbell_enabled = setting_flag(DATACRUMBS_ENV_ENGINE_DOORBELL);
   const std::string drain_us = setting(DATACRUMBS_ENV_ENGINE_DRAIN_US);
   if (!drain_us.empty()) {
     const int v = std::atoi(drain_us.c_str());

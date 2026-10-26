@@ -58,6 +58,15 @@ using datacrumbs::client::mono_ns;
 using datacrumbs::client::tracer_thread_active;
 
 constexpr uint16_t kCreateCq = 0x0400;
+// CREATE_QP input, mlx5_ifc.h (rdma-core): the QP context starts at 0x18, log_sq_size is bits
+// 1-4 of its byte 0xa. The doorbell record is two big-endian dwords, the receive counter and then
+// the send counter software bumps when it rings.
+constexpr uint16_t kCreateQp = 0x0500;
+constexpr size_t kQpLogSqSizeOffset = 0x18 + 0x0a;
+constexpr size_t kWqeBasicSize = 64;
+constexpr size_t kPage = 4096;
+constexpr size_t kQpSndDbrOffset = 4;
+constexpr size_t kCreateQpOutQpnOffset = 0x08;
 // INIT2RTR_QP input: the QP being connected, and in its QP context the peer QP and how often the
 // requester asks for an acknowledgement. A send completion is written when its acknowledgement
 // returns, so a coarse ack frequency moves send completions later than the receive they answer.
@@ -226,6 +235,21 @@ struct Cq {
   unsigned dpa_copy_fails = 0;
 };
 Cq g_cq[kMaxCq];
+
+/// A send queue whose doorbell record the sweep reads.
+struct Qp {
+  std::atomic<int> state{kStateFree};
+  uint32_t qpn = 0;
+  uint32_t umem_id = 0;
+  const unsigned char* sq_dbr = nullptr;
+  uint32_t last = 0;
+  bool have = false;
+};
+constexpr int kMaxQp = 64;
+Qp g_qp[kMaxQp];
+std::atomic<uint64_t> g_doorbell_qp{0};
+std::atomic<uint64_t> g_doorbell_unbound{0};
+std::atomic<uint64_t> g_doorbells{0};
 
 /// A FlexIO process seen at flexio_process_create: its heap umem id names the CQs that live in DPA
 /// memory, and heap base + the CQ's umem offset is where each ring starts.
@@ -1111,6 +1135,40 @@ bool copy_dpa_ring(Cq& cq) {
   return true;
 }
 
+bool doorbell_enabled() {
+  return datacrumbs::ConfigurationManager::runtime().engine_doorbell_enabled;
+}
+
+datacrumbs::client::AggSite* g_doorbell_site = nullptr;
+
+/// Records each move of a send queue's doorbell counter, timed by this sweep. The sweep period
+/// bounds that time, so it splits a late doorbell from a late NIC only above that period.
+void poll_doorbells() {
+  datacrumbs::client::PfwSink* s = sink();
+  if (g_doorbell_site == nullptr || s == nullptr) return;
+  for (int i = 0; i < kMaxQp; ++i) {
+    Qp& q = g_qp[i];
+    if (q.state.load(std::memory_order_acquire) != kStateReady) continue;
+    uint32_t v = 0;
+    if (!guarded_walk([&q, &v] { v = be32_at(q.sq_dbr); })) {
+      q.state.store(kStateFree, std::memory_order_release);
+      continue;
+    }
+    if (q.have && v == q.last) continue;
+    q.last = v;
+    q.have = true;
+    datacrumbs::client::NumArg args[2]{};
+    args[0].key = "devx.qp";
+    args[0].kind = datacrumbs::client::NumKind::UINT;
+    args[0].u = q.qpn;
+    args[1].key = "sq.dbr";
+    args[1].kind = datacrumbs::client::NumKind::UINT;
+    args[1].u = v;
+    s->record_ex(g_doorbell_site, mono_ns(), 0, args, 2, 2, false);
+    g_doorbells.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
 /// Sweep every ready CQ once. A sweep that finds the dereg hook mid-drain skips this tick; the
 /// next one picks up whatever is left.
 size_t sweep_all_cqs() {
@@ -1119,6 +1177,8 @@ size_t sweep_all_cqs() {
     return 0;
   }
   size_t read = 0;
+  // Before the completions, so a doorbell and the completion it caused land in one tick in order.
+  poll_doorbells();
   for (int i = 0; i < kMaxCq; ++i) {
     if (g_cq[i].state.load(std::memory_order_acquire) == kStateDying) {
       std::free(g_cq[i].dpa_buf);
@@ -1229,7 +1289,9 @@ void emit_health() {
       R"("health.lapped_resync":%llu,"health.lapped_delta":%llu,)"
       R"("health.walk_skipped":%llu,"health.cq_sweep_skipped":%llu,)"
       R"("health.dpa_cq":%llu,"health.dpa_copy_fail":%llu,"health.dpa_unbound":%llu,)"
-      R"("health.walk_fault":%llu,"health.walk_guard":%d,"tool":"engine_hwts"}})"
+      R"("health.walk_fault":%llu,"health.walk_guard":%d,)"
+      R"("health.doorbell_qp":%llu,"health.doorbell_unbound":%llu,"health.doorbells":%llu,)"
+      R"("tool":"engine_hwts"}})"
       "\n",
       static_cast<unsigned long long>(s->next_id()),
       static_cast<long>(datacrumbs::client::self_pid()), static_cast<int>(tid()),
@@ -1253,7 +1315,10 @@ void emit_health() {
       static_cast<unsigned long long>(g_dpa_copy_fail.load()),
       static_cast<unsigned long long>(g_dpa_unbound.load()),
       static_cast<unsigned long long>(g_walk_fault.load()),
-      datacrumbs::utils::doca_walk::installed() ? 1 : 0);
+      datacrumbs::utils::doca_walk::installed() ? 1 : 0,
+      static_cast<unsigned long long>(g_doorbell_qp.load()),
+      static_cast<unsigned long long>(g_doorbell_unbound.load()),
+      static_cast<unsigned long long>(g_doorbells.load()));
   if (n > 0) s->write(line, static_cast<std::size_t>(n));
 }
 
@@ -1543,6 +1608,44 @@ int proc_destroy_wrap(void* proc) {
   return real(proc);
 }
 
+/// Binds a new QP's send doorbell record. DOCA puts it in the page right after the send queue,
+/// in the same umem, and names neither in the fields the public mlx5_ifc.h gives for it, so the
+/// umem is found by size: this context's registration of the send queue plus one page.
+void bind_qp_doorbell(void* ctx, const uint8_t* cmd, size_t inlen, const void* out, size_t outlen) {
+  if (!doorbell_enabled()) return;
+  if (inlen < kQpLogSqSizeOffset + 1 || out == nullptr || outlen < kCreateQpOutQpnOffset + 4) return;
+  const size_t sq_bytes = (size_t{1} << ((cmd[kQpLogSqSizeOffset] >> 3) & 0xf)) * kWqeBasicSize;
+  const size_t dbr_off = (sq_bytes + kPage - 1) / kPage * kPage;
+  int match = -1;
+  for (int i = 0; i < kMaxUmem; ++i) {
+    if (g_umem[i].state.load(std::memory_order_acquire) != kStateReady) continue;
+    if (g_umem[i].ctx != ctx || g_umem[i].addr == nullptr) continue;
+    if (g_umem[i].size == dbr_off + kPage) match = i;
+  }
+  if (stats_enabled())
+    DC_LOG_INFO("[doca_engine] qp doorbell: send queue %zu bytes, umem %d of %zu bytes", sq_bytes,
+                match >= 0 ? static_cast<int>(g_umem[match].id) : -1,
+                match >= 0 ? g_umem[match].size : 0);
+  if (match < 0) {
+    g_doorbell_unbound.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  for (int q = 0; q < kMaxQp; ++q) {
+    int expect = kStateFree;
+    if (!g_qp[q].state.compare_exchange_strong(expect, kStateClaimed, std::memory_order_acquire))
+      continue;
+    g_qp[q].qpn = be32_at(static_cast<const unsigned char*>(out) + kCreateQpOutQpnOffset) & 0xffffffu;
+    g_qp[q].umem_id = g_umem[match].id;
+    g_qp[q].sq_dbr =
+        static_cast<const unsigned char*>(g_umem[match].addr) + dbr_off + kQpSndDbrOffset;
+    g_qp[q].have = false;
+    g_qp[q].state.store(kStateReady, std::memory_order_release);
+    g_doorbell_qp.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  g_doorbell_unbound.fetch_add(1, std::memory_order_relaxed);
+}
+
 void* obj_create_wrap(void* ctx, const void* in, size_t inlen, void* out, size_t outlen) {
   auto real = reinterpret_cast<void* (*)(void*, const void*, size_t, void*, size_t)>(
       gotcha_get_wrappee(g_h_obj_create));
@@ -1553,6 +1656,10 @@ void* obj_create_wrap(void* ctx, const void* in, size_t inlen, void* out, size_t
   // scanned.
   if (!enabled() || tracer_thread_active() || inlen <= kCqUmemValidOffset) return r;
   const uint8_t* cmd = static_cast<const uint8_t*>(in);
+  if (static_cast<uint16_t>((cmd[0] << 8) | cmd[1]) == kCreateQp) {
+    if (r != nullptr) bind_qp_doorbell(ctx, cmd, inlen, out, outlen);
+    return r;
+  }
   if (static_cast<uint16_t>((cmd[0] << 8) | cmd[1]) != kCreateCq) return r;
   // Bind the umem the command names, not the one registered most recently. Concurrent contexts
   // interleave their registrations, and picking the most recent one can silently bind the wrong
@@ -1650,6 +1757,10 @@ int umem_dereg_wrap(void* umem) {
       g_cq[c].buf = nullptr;
       g_cq[c].state.store(kStateFree, std::memory_order_release);
     }
+    for (int q = 0; q < kMaxQp; ++q)
+      if (g_qp[q].state.load(std::memory_order_acquire) == kStateReady &&
+          g_qp[q].umem_id == g_umem[i].id)
+        g_qp[q].state.store(kStateFree, std::memory_order_release);
     g_umem[i].addr = nullptr;
     g_umem[i].state.store(kStateFree, std::memory_order_release);
     g_ring_pushing.clear(std::memory_order_release);
@@ -1871,6 +1982,8 @@ void datacrumbs::client::doca::init() {
   if (rc != GOTCHA_SUCCESS && rc != GOTCHA_FUNCTION_NOT_FOUND)
     DC_LOG_ERROR("[doca_engine] gotcha_wrap failed: %d", static_cast<int>(rc));
   datacrumbs::utils::doca_walk::install();
+  if (doorbell_enabled() && sink() != nullptr)
+    g_doorbell_site = sink()->site("doorbell", DC_CAT, DC_TYPE, "engine_hwts");
   auto& bg = datacrumbs::client::Background::get();
   g_sweep_task = bg.add_scan([] { return sweep_tick() != 0; });
   g_format_task = bg.add_write([] { return format_tick(); });

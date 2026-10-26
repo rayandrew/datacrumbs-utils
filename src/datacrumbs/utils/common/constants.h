@@ -59,6 +59,7 @@
 #define DATACRUMBS_ENV_ENGINE_JOIN "DATACRUMBS_ENGINE_JOIN"
 #define DATACRUMBS_ENV_ENGINE_SCAN_CACHE "DATACRUMBS_ENGINE_SCAN_CACHE"
 #define DATACRUMBS_ENV_ENGINE_SKIP_IDLE "DATACRUMBS_ENGINE_SKIP_IDLE"
+#define DATACRUMBS_ENV_ENGINE_DOORBELL "DATACRUMBS_ENGINE_DOORBELL"
 // Timer drain: how often a dedicated thread sweeps every bound CQ, independent of the app's own
 // doca_pe_progress calls. Microseconds, since 100us is well under the millisecond scale the shared
 // telemetry interval uses elsewhere.

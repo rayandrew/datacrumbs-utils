@@ -118,6 +118,9 @@ class ConfigurationManager {
   /// that is parked when traffic returns can have its entries overwritten before the next
   /// look, and those completions then join to nothing. Off measures what the parking costs.
   bool engine_skip_idle_enabled{true};
+  /// Read each send queue's doorbell record on every sweep and record when software moves it, so a
+  /// trace splits "the WQE was published" from "the NIC sent it". Off by default.
+  bool engine_doorbell_enabled{false};
   // How often the engine module's own drain thread sweeps every bound CQ, in addition to the
   // app's own doca_pe_progress calls. Microseconds. Left a raw uint here rather than a duration
   // type, matching dpa_anchor_interval_s below.

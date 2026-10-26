@@ -20,6 +20,7 @@
 #include <datacrumbs/utils/common/background.h>
 #include <datacrumbs/utils/common/clock.h>
 #include <datacrumbs/utils/client/doca/cq_lap.h>
+#include <datacrumbs/utils/client/doca/walk_guard.h>
 #include <datacrumbs/utils/common/configuration_manager.h>
 #include <datacrumbs/utils/common/constants.h>
 #include <datacrumbs/utils/common/pfw_sink.h>
@@ -251,6 +252,16 @@ std::atomic<uint64_t> g_dpa_copy_fail{0};
 /// CREATE_CQs that looked like DPA CQs and were not bound: an ambiguous process, or a ring that
 /// does not fit the heap.
 std::atomic<uint64_t> g_dpa_unbound{0};
+
+/// Regions and CQs retired because a walk faulted on them.
+std::atomic<uint64_t> g_walk_fault{0};
+
+template <class F>
+bool guarded_walk(F&& walk) {
+  if (datacrumbs::utils::doca_walk::guarded(walk)) return true;
+  g_walk_fault.fetch_add(1, std::memory_order_relaxed);
+  return false;
+}
 
 // What a submit asked the engine to do, from the work-queue entry it wrote. A completion cannot
 // answer this: compress, DMA and AES all land as one requester completion. Work goes out as
@@ -1126,7 +1137,13 @@ size_t sweep_all_cqs() {
           g_cq[i].state.load(std::memory_order_acquire) != kStateReady)
         continue;
     }
-    read += drain(g_cq[i], i);
+    size_t n = 0;
+    if (guarded_walk([i, &n] { n = drain(g_cq[i], i); })) {
+      read += n;
+    } else {
+      g_cq[i].buf = nullptr;
+      g_cq[i].state.store(kStateFree, std::memory_order_release);
+    }
   }
   g_ring_pushing.clear(std::memory_order_release);
   return read;
@@ -1212,7 +1229,7 @@ void emit_health() {
       R"("health.lapped_resync":%llu,"health.lapped_delta":%llu,)"
       R"("health.walk_skipped":%llu,"health.cq_sweep_skipped":%llu,)"
       R"("health.dpa_cq":%llu,"health.dpa_copy_fail":%llu,"health.dpa_unbound":%llu,)"
-      R"("tool":"engine_hwts"}})"
+      R"("health.walk_fault":%llu,"health.walk_guard":%d,"tool":"engine_hwts"}})"
       "\n",
       static_cast<unsigned long long>(s->next_id()),
       static_cast<long>(datacrumbs::client::self_pid()), static_cast<int>(tid()),
@@ -1234,7 +1251,9 @@ void emit_health() {
       static_cast<unsigned long long>(g_cq_sweep_skipped.load()),
       static_cast<unsigned long long>(g_dpa_cq.load()),
       static_cast<unsigned long long>(g_dpa_copy_fail.load()),
-      static_cast<unsigned long long>(g_dpa_unbound.load()));
+      static_cast<unsigned long long>(g_dpa_unbound.load()),
+      static_cast<unsigned long long>(g_walk_fault.load()),
+      datacrumbs::utils::doca_walk::installed() ? 1 : 0);
   if (n > 0) s->write(line, static_cast<std::size_t>(n));
 }
 
@@ -1284,8 +1303,13 @@ size_t sweep_tick() {
     if (g_ring_pushing.test_and_set(std::memory_order_acquire)) {
       g_walk_skipped.fetch_add(1, std::memory_order_relaxed);
     } else {
-      for (int i = 0; i < kMaxUmem; ++i)
-        if (g_umem[i].state.load(std::memory_order_acquire) == kStateReady) scan_wqe(g_umem[i]);
+      for (int i = 0; i < kMaxUmem; ++i) {
+        if (g_umem[i].state.load(std::memory_order_acquire) != kStateReady) continue;
+        if (!guarded_walk([i] { scan_wqe(g_umem[i]); })) {
+          g_umem[i].addr = nullptr;
+          g_umem[i].state.store(kStateFree, std::memory_order_release);
+        }
+      }
       g_ring_pushing.clear(std::memory_order_release);
     }
   }
@@ -1841,6 +1865,7 @@ void datacrumbs::client::doca::init() {
   const gotcha_error_t rc = ::gotcha_wrap(selected, n, "datacrumbs_engine");
   if (rc != GOTCHA_SUCCESS && rc != GOTCHA_FUNCTION_NOT_FOUND)
     DC_LOG_ERROR("[doca_engine] gotcha_wrap failed: %d", static_cast<int>(rc));
+  datacrumbs::utils::doca_walk::install();
   auto& bg = datacrumbs::client::Background::get();
   g_sweep_task = bg.add_scan([] { return sweep_tick() != 0; });
   g_format_task = bg.add_write([] { return format_tick(); });

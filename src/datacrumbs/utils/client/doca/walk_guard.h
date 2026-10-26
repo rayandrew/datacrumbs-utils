@@ -38,24 +38,37 @@ inline void on_fault(int sig, siginfo_t* si, void* uc) {
   sigaction(sig, &dfl, nullptr);
 }
 
-/// Install the handler for SIGSEGV and SIGBUS. Call once, before the first guarded walk.
-inline void install() {
+inline bool is_ours(const struct sigaction& a) {
+  return (a.sa_flags & SA_SIGINFO) != 0 && a.sa_sigaction == on_fault;
+}
+
+/// Put our handler on @p sig unless it is already there. Whatever was there becomes the handler a
+/// fault outside a walk goes to.
+inline void take(int sig, struct sigaction* prev) {
+  struct sigaction cur {};
+  if (sigaction(sig, nullptr, &cur) != 0 || is_ours(cur)) return;
   struct sigaction sa {};
   sa.sa_sigaction = on_fault;
   // SA_NODEFER: the jump leaves the handler without restoring the mask, so the signal must not
   // stay blocked, or the next fault on this thread would kill the process outright.
   sa.sa_flags = SA_SIGINFO | SA_NODEFER | SA_ONSTACK;
   sigemptyset(&sa.sa_mask);
-  sigaction(SIGSEGV, &sa, &g_prev_segv);
-  sigaction(SIGBUS, &sa, &g_prev_bus);
+  *prev = cur;
+  sigaction(sig, &sa, nullptr);
 }
 
-/// Whether the SIGSEGV handler is still ours. A library that installs its own handler later takes
-/// the fault first, and a walk is then unguarded.
+/// Install the handler for SIGSEGV and SIGBUS, before the first guarded walk. Call it again
+/// later: a library that installs its own handler afterwards (UCX at MPI_Init) takes the fault
+/// first, and this puts ours back in front of it.
+inline void install() {
+  take(SIGSEGV, &g_prev_segv);
+  take(SIGBUS, &g_prev_bus);
+}
+
+/// Whether the SIGSEGV handler is still ours.
 inline bool installed() {
   struct sigaction cur {};
-  if (sigaction(SIGSEGV, nullptr, &cur) != 0) return false;
-  return (cur.sa_flags & SA_SIGINFO) != 0 && cur.sa_sigaction == on_fault;
+  return sigaction(SIGSEGV, nullptr, &cur) == 0 && is_ours(cur);
 }
 
 /// Run @p walk with faults caught. Returns false if it faulted. A fault leaves through

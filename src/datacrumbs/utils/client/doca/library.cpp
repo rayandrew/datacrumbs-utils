@@ -1296,6 +1296,11 @@ namespace {
 /// read, then every completion ring. Nothing here formats: a 4096-entry ring wraps in 0.7 ms at
 /// line rate, and a sweep that also formatted fell a lap behind and stopped reading for good.
 size_t sweep_tick() {
+  // A library that installs its own SIGSEGV handler after ours (UCX at MPI_Init) would leave
+  // every walk unguarded. One sigaction read every so many ticks puts ours back in front.
+  static std::atomic<unsigned> ticks{0};
+  if (ticks.fetch_add(1, std::memory_order_relaxed) % 1024 == 0)
+    datacrumbs::utils::doca_walk::install();
   // The walk reads memory the application owns and can free at any moment. It runs under the
   // same flag the dereg hook takes, so a region cannot be unmapped inside a walk. A tick that
   // loses the flag skips the send queues and the next one picks them up.
@@ -1874,6 +1879,7 @@ void datacrumbs::client::doca::init() {
 void datacrumbs::client::doca::drain_for_exit() {
   if (g_sweep_task == nullptr) return;
   datacrumbs::client::TracerThread mark;
+  datacrumbs::utils::doca_walk::install();
   sweep_tick();
   while (drain_ring()) {
   }
@@ -1889,6 +1895,8 @@ void datacrumbs::client::doca::fini() {
   bg.remove(g_format_task);
   if (g_sweep_task != nullptr) {
     datacrumbs::client::TracerThread mark;
+    // The last sweep runs at exit, where the app's buffers are being freed.
+    datacrumbs::utils::doca_walk::install();
     sweep_tick();
     // One tick drains kDrainPerTick; a program that exits right after its loop leaves more.
     while (drain_ring()) {

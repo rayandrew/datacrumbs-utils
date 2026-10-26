@@ -48,6 +48,7 @@ int in_child(F&& body) {
 }
 
 void prior_handler(int, siginfo_t*, void*) { _exit(42); }
+void later_handler(int, siginfo_t*, void*) { _exit(43); }
 
 void guarded_read_of_live_memory_succeeds() {
   unsigned char live[64] = {7};
@@ -97,6 +98,24 @@ void installed_reports_a_later_handler() {
         "installed() is true for ours and false once another handler replaces it");
 }
 
+void install_again_takes_back_from_a_later_handler() {
+  const int status = in_child([] {
+    struct sigaction sa {};
+    sa.sa_sigaction = later_handler;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, nullptr);
+    if (walk::installed()) _exit(1);
+    walk::install();
+    if (!walk::installed()) _exit(2);
+    volatile unsigned char* p = dead_page();
+    if (walk::guarded([&] { (void)p[0]; })) _exit(3);
+    (void)p[0];
+  });
+  check(WIFEXITED(status) && WEXITSTATUS(status) == 43,
+        "install() again guards walks and sends other faults to the later handler");
+}
+
 }  // namespace
 
 int main() {
@@ -106,6 +125,7 @@ int main() {
   fault_outside_a_guard_still_kills();
   fault_outside_a_guard_reaches_the_prior_handler();
   installed_reports_a_later_handler();
+  install_again_takes_back_from_a_later_handler();
   if (g_failures != 0) {
     std::fprintf(stderr, "%d failure(s)\n", g_failures);
     return 1;

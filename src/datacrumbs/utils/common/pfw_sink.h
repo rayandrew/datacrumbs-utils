@@ -672,6 +672,9 @@ class PfwSink {
       while (cap * 2 <= want) cap *= 2;
       slot = new RawRecord[cap];
       mask = cap - 1;
+      // Fault every page in now, once. A first write to a fresh page on the recording thread is a
+      // page fault in the middle of its work.
+      std::memset(static_cast<void*>(slot), 0, cap * sizeof(RawRecord));
     }
   };
   /// One thread's slots, one pointer per site, allocated on the thread's first call to the site,

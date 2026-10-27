@@ -41,7 +41,9 @@ struct State {
   bool perf_started = false;
   // The event read returns the whole buffer each time, not a drain, and a buffer survives a re-arm.
   // Per thread: one watermark across threads drops another thread's older stamps read later.
-  std::map<uint32_t, uint64_t> last_event_us;
+  // Per process too, since thread ids repeat across processes. The anchor's newer stamps on its
+  // thread 0 dropped a full page of the workload's thread 0 as already emitted.
+  std::map<std::pair<uint32_t, uint32_t>, uint64_t> last_event_us;
   bool cut_done = false;
   unsigned long long pages_flipped = 0;  // re-arms on a full event page, for the stop log
   bool want_events = false;              // DATACRUMBS_DPA_MODE=events
@@ -127,14 +129,22 @@ void cut_stale_events() {
     return;
   std::vector<doca_telemetry_dpa_event_sample_t> ev(
       2 * (bytes / static_cast<uint32_t>(sizeof(doca_telemetry_dpa_event_sample_t))));
-  uint32_t got = 0;
-  if (doca_telemetry_dpa_read_perf_event_list(g_state.dpa, g_state.all_proc, g_state.all_thread,
-                                              &got, ev.data()) != DOCA_SUCCESS)
-    return;
-  if (got > ev.size()) got = static_cast<uint32_t>(ev.size());
-  for (uint32_t i = 0; i < got; i++) {
-    uint64_t& w = g_state.last_event_us[ev[i].dpa_thread_id];
-    if (ev[i].timestamp > w) w = ev[i].timestamp;
+  // One process at a time, because a sample carries no process id and a read for every process
+  // returns one process's page only.
+  std::set<uint32_t> procs = g_state.procs;
+  for (const auto& [t, p] : g_state.thread_proc) procs.insert(p);
+  for (const uint32_t proc : procs) {
+    uint32_t got = 0;
+    if (doca_telemetry_dpa_read_perf_event_list(g_state.dpa, proc, g_state.all_thread, &got,
+                                                ev.data()) != DOCA_SUCCESS)
+      continue;
+    if (got > ev.size()) got = static_cast<uint32_t>(ev.size());
+    for (uint32_t i = 0; i < got; i++) {
+      // An unset entry holds a far-future stamp, and as a watermark it would drop the thread.
+      if (ev[i].timestamp >= (1ull << 48)) continue;
+      uint64_t& w = g_state.last_event_us[{proc, ev[i].dpa_thread_id}];
+      if (ev[i].timestamp > w) w = ev[i].timestamp;
+    }
   }
   g_state.cut_done = true;
 }
@@ -423,18 +433,15 @@ void read_process_events(const datacrumbs::PluginEmit& emit, uint32_t proc_id, u
     i += 2;
     // A stamp far beyond every other is an unset entry, not a future event.
     if (in.timestamp > hi_sane) continue;
-    uint64_t& mark = g_state.last_event_us[in.dpa_thread_id];
+    uint64_t& mark = g_state.last_event_us[{proc_id, in.dpa_thread_id}];
     if (in.timestamp <= mark) continue;
-    const auto proc = g_state.thread_proc.find(in.dpa_thread_id);
     // Same exclusion as sample(): the anchor is datacrumbs' own DPA process, not the workload.
-    if (proc != g_state.thread_proc.end() && is_anchor_process(proc->second) &&
-        !datacrumbs::ConfigurationManager::runtime().dpa_keep_anchor)
+    if (is_anchor_process(proc_id) && !datacrumbs::ConfigurationManager::runtime().dpa_keep_anchor)
       continue;
 
     auto* args = new DataCrumbsArgs();
     (*args)["dpa.thread"] = static_cast<unsigned long long>(in.dpa_thread_id);
-    if (proc != g_state.thread_proc.end())
-      (*args)["dpa.process"] = static_cast<unsigned long long>(proc->second);
+    (*args)["dpa.process"] = static_cast<unsigned long long>(proc_id);
     const auto name = g_state.thread_name.find(in.dpa_thread_id);
     if (name != g_state.thread_name.end()) (*args)["dpa.thread_name"] = name->second;
     // eu_id is not an execution unit: it is a big-endian pair counter (bswap16 undoes that),

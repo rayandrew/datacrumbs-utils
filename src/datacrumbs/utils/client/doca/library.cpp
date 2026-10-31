@@ -306,9 +306,13 @@ struct Wqe {
   /// engine reports when an operation finished and never when it started, so this is the only
   /// available start, and it is early by the cost of the submit call rather than by the queue wait.
   uint64_t submit_ns;
+  /// The start of the walk before the one that found this entry, which saw its slot without it:
+  /// the entry was written later, so this is a CPU time surely before its completion. 0 when the
+  /// walk does not compare slots, and then a slot's absence was never observed.
+  uint64_t absent_ns;
 
-  /// Deliberately excludes submit_ns: it is when the entry was seen, not part of what the entry
-  /// says, and comparing it would make every rescan look like a new submit.
+  /// Deliberately excludes submit_ns and absent_ns: they say when the entry was seen, not what it
+  /// says, and comparing them would make every rescan look like a new submit.
   bool operator==(const Wqe& o) const {
     return qpn == o.qpn && opcode_mod == o.opcode_mod && opcode == o.opcode &&
            src_len == o.src_len && dst_len == o.dst_len;
@@ -961,6 +965,9 @@ void emit_from_raw(const RawCqe& r) {
   // NIC side.
   const auto seen_on_axis = static_cast<unsigned long long>(
       seen_ns != 0 ? s->clock().remap(seen_ns) / DATACRUMBS_TIME_DIVISOR_NS : 0);
+  const auto absent_on_axis = static_cast<unsigned long long>(
+      joined && req.absent_ns != 0 ? s->clock().remap(req.absent_ns) / DATACRUMBS_TIME_DIVISOR_NS
+                                   : 0);
   char line[704];
   const int n = std::snprintf(
       line, sizeof(line),
@@ -969,7 +976,7 @@ void emit_from_raw(const RawCqe& r) {
       // did not: COMPLETE with a zero duration would draw as a zero-width box and hide the
       // difference between instantaneous and unknown.
       R"({"id":%llu,"name":"%s","cat":")" DC_CAT R"(","type":")" DC_TYPE
-      R"(","pid":%ld,"tid":%d,"ts":%llu,"dur":%llu,"ph":%u,"args":{"hhash":"%s","cqe.clock":"%s","cqe.phc":%d,"cqe.bytes":%u,"cqe.imm":%u,"cqe.opcode":%u,"cqe.class":"%s","cqe.cq":%d,"engine.op":"%s","engine.src_len":%llu,"engine.dst_len":%llu,"cqe.submit_delta_ns":%lld,"cqe.hw_ns":%llu,"cqe.join":"%s","mlx5.opcode":"%s","mlx5.opcode_raw":%u,"cqe.qpn":%u,"cqe.sop":%u,"cqe.dpa":%d,"cqe.seen_ns":%llu,"tool":"engine_hwts"}})"
+      R"(","pid":%ld,"tid":%d,"ts":%llu,"dur":%llu,"ph":%u,"args":{"hhash":"%s","cqe.clock":"%s","cqe.phc":%d,"cqe.bytes":%u,"cqe.imm":%u,"cqe.opcode":%u,"cqe.class":"%s","cqe.cq":%d,"engine.op":"%s","engine.src_len":%llu,"engine.dst_len":%llu,"cqe.submit_delta_ns":%lld,"cqe.hw_ns":%llu,"cqe.join":"%s","mlx5.opcode":"%s","mlx5.opcode_raw":%u,"cqe.qpn":%u,"cqe.sop":%u,"cqe.dpa":%d,"cqe.seen_ns":%llu,"cqe.absent_ns":%llu,"tool":"engine_hwts"}})"
       "\n",
       static_cast<unsigned long long>(s->next_id()), record_name,
       static_cast<long>(datacrumbs::client::self_pid()), static_cast<int>(tid()),
@@ -978,7 +985,7 @@ void emit_from_raw(const RawCqe& r) {
       r.imm(), opcode, klass, cq_idx, namebuf, static_cast<unsigned long long>(req.src_len),
       static_cast<unsigned long long>(req.dst_len), submit_delta,
       static_cast<unsigned long long>(ref), join_state, opcode_name, opcode_raw, qpn,
-      static_cast<unsigned>(r.sop()), dpa ? 1 : 0, seen_on_axis);
+      static_cast<unsigned>(r.sop()), dpa ? 1 : 0, seen_on_axis, absent_on_axis);
   if (n > 0) {
     s->write(line, static_cast<std::size_t>(n));
     g_emitted.fetch_add(1, std::memory_order_relaxed);
@@ -1867,6 +1874,7 @@ void scan_wqe(Umem& u) {
     // duration measured from when the sweep happened to look.
     w.submit_ns =
         (have_newest && idx == newest) ? g_last_submit_ns.load(std::memory_order_relaxed) : 0;
+    w.absent_ns = use_cache ? last : 0;
     // Segments after the control one are {byte_count, lkey, addr} big-endian. The first is the
     // operation's own descriptor and reads zero or one byte; source and destination follow, as a
     // 57-byte decompress and a 23-into-35-byte encrypt both confirmed.

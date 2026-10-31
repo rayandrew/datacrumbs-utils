@@ -856,8 +856,11 @@ void emit_from_raw(const RawCqe& r) {
   // lookup would only ever miss; skip it rather than pay an atomic exchange for a guaranteed no.
   // A DPA CQ's submits are DPA-side writes this reader never walks, so a lookup could only miss.
   const bool dpa = r.dpa != 0;
+  // A responder completion's counter indexes the receive queue, so the send queue table would
+  // hand it an unrelated send's submit.
+  const bool requester = opcode == 0 || opcode == kCqeReqErr;
   const bool join_is_on =
-      !dpa && capture_mode() == EngineCaptureMode::RECORDS && join_enabled();
+      !dpa && requester && capture_mode() == EngineCaptureMode::RECORDS && join_enabled();
   if (join_is_on && take_pending(qpn, wqe_counter, &req)) {
     joined = true;
     g_joined_any.store(true, std::memory_order_relaxed);
@@ -872,11 +875,12 @@ void emit_from_raw(const RawCqe& r) {
   const char* klass = cqe_op_name(static_cast<uint8_t>(opcode));
   if (klass == nullptr) klass = "reserved";
   // matched: the submit was found. startup: posted before this process attached, so there was
-  // never a submit to find. missed: the scanner should have seen it and did not.
+  // never a submit to find. missed: the scanner should have seen it and did not. none: no submit
+  // could be joined, a DPA queue or a responder completion.
   const char* join_state =
-      dpa ? "none"
-          : joined ? "matched"
-                   : (g_joined_any.load(std::memory_order_relaxed) ? "missed" : "startup");
+      dpa || !requester ? "none"
+      : joined          ? "matched"
+                        : (g_joined_any.load(std::memory_order_relaxed) ? "missed" : "startup");
   if (capture_mode() == EngineCaptureMode::AGGREGATE) {
     // Tally first: DATACRUMBS_ENGINE_SAMPLE names every Nth completion, not every Nth that
     // happens to also be joined, so the sample decision must run whether or not the tally

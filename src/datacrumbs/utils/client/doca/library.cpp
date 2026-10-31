@@ -957,7 +957,11 @@ void emit_from_raw(const RawCqe& r) {
     s->aggregate(record_name, DC_CAT, DC_TYPE, start, dur, nums, 1, cats, 1);
     return;
   }
-  char line[640];
+  // When the sweep found this entry, after the NIC wrote it, so it bounds the CPU clock from the
+  // NIC side.
+  const auto seen_on_axis = static_cast<unsigned long long>(
+      seen_ns != 0 ? s->clock().remap(seen_ns) / DATACRUMBS_TIME_DIVISOR_NS : 0);
+  char line[704];
   const int n = std::snprintf(
       line, sizeof(line),
       // The engine reports when an operation finished and never when it started. A joined submit
@@ -965,7 +969,7 @@ void emit_from_raw(const RawCqe& r) {
       // did not: COMPLETE with a zero duration would draw as a zero-width box and hide the
       // difference between instantaneous and unknown.
       R"({"id":%llu,"name":"%s","cat":")" DC_CAT R"(","type":")" DC_TYPE
-      R"(","pid":%ld,"tid":%d,"ts":%llu,"dur":%llu,"ph":%u,"args":{"hhash":"%s","cqe.clock":"%s","cqe.phc":%d,"cqe.bytes":%u,"cqe.imm":%u,"cqe.opcode":%u,"cqe.class":"%s","cqe.cq":%d,"engine.op":"%s","engine.src_len":%llu,"engine.dst_len":%llu,"cqe.submit_delta_ns":%lld,"cqe.hw_ns":%llu,"cqe.join":"%s","mlx5.opcode":"%s","mlx5.opcode_raw":%u,"cqe.qpn":%u,"cqe.sop":%u,"cqe.dpa":%d,"tool":"engine_hwts"}})"
+      R"(","pid":%ld,"tid":%d,"ts":%llu,"dur":%llu,"ph":%u,"args":{"hhash":"%s","cqe.clock":"%s","cqe.phc":%d,"cqe.bytes":%u,"cqe.imm":%u,"cqe.opcode":%u,"cqe.class":"%s","cqe.cq":%d,"engine.op":"%s","engine.src_len":%llu,"engine.dst_len":%llu,"cqe.submit_delta_ns":%lld,"cqe.hw_ns":%llu,"cqe.join":"%s","mlx5.opcode":"%s","mlx5.opcode_raw":%u,"cqe.qpn":%u,"cqe.sop":%u,"cqe.dpa":%d,"cqe.seen_ns":%llu,"tool":"engine_hwts"}})"
       "\n",
       static_cast<unsigned long long>(s->next_id()), record_name,
       static_cast<long>(datacrumbs::client::self_pid()), static_cast<int>(tid()),
@@ -974,7 +978,7 @@ void emit_from_raw(const RawCqe& r) {
       r.imm(), opcode, klass, cq_idx, namebuf, static_cast<unsigned long long>(req.src_len),
       static_cast<unsigned long long>(req.dst_len), submit_delta,
       static_cast<unsigned long long>(ref), join_state, opcode_name, opcode_raw, qpn,
-      static_cast<unsigned>(r.sop()), dpa ? 1 : 0);
+      static_cast<unsigned>(r.sop()), dpa ? 1 : 0, seen_on_axis);
   if (n > 0) {
     s->write(line, static_cast<std::size_t>(n));
     g_emitted.fetch_add(1, std::memory_order_relaxed);

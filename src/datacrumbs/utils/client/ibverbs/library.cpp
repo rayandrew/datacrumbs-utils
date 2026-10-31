@@ -290,7 +290,7 @@ struct HwtsEvt {
   uint64_t t;
   uint64_t wr_id;
   uint64_t dur_ns;
-  uint64_t obs_ns;  // aggregate bucket; 0 means when written
+  uint64_t obs_ns;  // when the poll returned it, CLOCK_MONOTONIC; 0 means when written
   struct mlx5dv_clock_info ci;  // Clk::DEVICE only
   const char* post_op;          // Kind::POST_OP only, a literal from the opcode table
   uint32_t op;
@@ -415,26 +415,31 @@ std::size_t format_evt(char* line, std::size_t cap, datacrumbs::client::PfwSink*
     const char* w = wqe_opcode_name(e.wqe_op_raw);
     if (w != nullptr) wqe_op = w;
   }
+  // When the poll returned this completion, on the CPU's axis: after the NIC wrote it, so the pair
+  // bounds the CPU clock against the NIC clock. 0 when the stamp is itself a CPU time.
+  const bool seen_known = e.clk != Clk::CPU && e.obs_ns != 0;
+  const auto seen = static_cast<unsigned long long>(
+      seen_known ? s->clock().remap(e.obs_ns) / DATACRUMBS_TIME_DIVISOR_NS : 0);
   const auto id = static_cast<unsigned long long>(s->next_id());
   if (e.ph == 1)
     n = std::snprintf(
         line, cap,
         R"({"id":%llu,"name":"%s","cat":")" DC_CAT R"(","type":")" DC_TYPE
-        R"(","pid":%ld,"tid":%d,"ts":%llu,"dur":%llu,"ph":1,"args":{"hhash":"%s","ibv.aligned":%u,"cqe.phc":%d,"ibv.wr_id":%llu,"ibv.opcode":%u,"ibv.imm":%u,"ibv.qp":%u,"mlx5.wqe":%u,"mlx5.sq_pi":%u,"cqe.bytes":%u,"mlx5.op":"%.31s","mlx5.op_raw":%u,"tool":"rdma_hwts"}})"
+        R"(","pid":%ld,"tid":%d,"ts":%llu,"dur":%llu,"ph":1,"args":{"hhash":"%s","ibv.aligned":%u,"cqe.phc":%d,"ibv.wr_id":%llu,"ibv.opcode":%u,"ibv.imm":%u,"ibv.qp":%u,"mlx5.wqe":%u,"mlx5.sq_pi":%u,"cqe.bytes":%u,"mlx5.op":"%.31s","mlx5.op_raw":%u,"cqe.seen_ns":%llu,"tool":"rdma_hwts"}})"
         "\n",
         id, opcode_name(e.op), pid, static_cast<int>(e.tid), ts,
         static_cast<unsigned long long>(e.dur_ns / DATACRUMBS_TIME_DIVISOR_NS), s->hhash().c_str(),
         ref != 0 ? 1u : 0u, e.phc, static_cast<unsigned long long>(e.wr_id), e.op, e.imm, e.qp,
-        e.wqe, e.sq_pi, e.bytes, wqe_op, static_cast<unsigned>(e.wqe_op_raw));
+        e.wqe, e.sq_pi, e.bytes, wqe_op, static_cast<unsigned>(e.wqe_op_raw), seen);
   else
     n = std::snprintf(
         line, cap,
         R"({"id":%llu,"name":"%s","cat":")" DC_CAT R"(","type":")" DC_TYPE
-        R"(","pid":%ld,"tid":%d,"ts":%llu,"ph":2,"args":{"hhash":"%s","ibv.aligned":%u,"cqe.phc":%d,"ibv.wr_id":%llu,"ibv.opcode":%u,"ibv.imm":%u,"ibv.qp":%u,"mlx5.wqe":%u,"ibv.count":%u,"mlx5.sq_pi":%u,"cqe.bytes":%u,"mlx5.op":"%.31s","mlx5.op_raw":%u,"tool":"rdma_hwts"}})"
+        R"(","pid":%ld,"tid":%d,"ts":%llu,"ph":2,"args":{"hhash":"%s","ibv.aligned":%u,"cqe.phc":%d,"ibv.wr_id":%llu,"ibv.opcode":%u,"ibv.imm":%u,"ibv.qp":%u,"mlx5.wqe":%u,"ibv.count":%u,"mlx5.sq_pi":%u,"cqe.bytes":%u,"mlx5.op":"%.31s","mlx5.op_raw":%u,"cqe.seen_ns":%llu,"tool":"rdma_hwts"}})"
         "\n",
         id, opcode_name(e.op), pid, static_cast<int>(e.tid), ts, s->hhash().c_str(),
         ref != 0 ? 1u : 0u, e.phc, static_cast<unsigned long long>(e.wr_id), e.op, e.imm, e.qp,
-        e.wqe, e.count, e.sq_pi, e.bytes, wqe_op, static_cast<unsigned>(e.wqe_op_raw));
+        e.wqe, e.count, e.sq_pi, e.bytes, wqe_op, static_cast<unsigned>(e.wqe_op_raw), seen);
   return n > 0 ? std::min(static_cast<std::size_t>(n), cap - 1) : 0;
 }
 
@@ -550,7 +555,10 @@ void emit_record(HwtsEvt& e) {
       e.ph = 1;  // COMPLETE, with a duration that was measured rather than assumed
     }
   }
-  e.obs_ns = g_poll_batch && g_poll_now != 0 ? g_poll_now : (e.clk == Clk::CPU ? e.t : 0);
+  if (g_poll_batch && g_poll_now != 0)
+    e.obs_ns = g_poll_now;
+  else if (e.clk == Clk::CPU)
+    e.obs_ns = e.t;
   e.kind = Kind::RECORD;
   e.tid = static_cast<pid_t>(tid());
   publish(e);
@@ -599,7 +607,9 @@ void emit(uint64_t hw_ns, uint64_t wr_id, uint32_t op, uint32_t imm, uint32_t qp
   HwtsEvt e{};
   e.phc = phc;
   if (hw_ns != 0) {
+    if (now == 0) now = mono_ns();
     e.t = hw_ns;
+    e.obs_ns = now;
     stamp_clock(e, ctx, phc, now);
   } else {
     e.t = cpu_ns != 0 ? cpu_ns : mono_ns();

@@ -687,6 +687,9 @@ uint32_t be32_at(const unsigned char* p);
 struct RawCqe {
   unsigned char cqe[kCqeSize];
   uint64_t cpu_ns;
+  // Read after the copy, so after the entry was valid. cpu_ns is the sweep's start, which can be
+  // before the hardware wrote the entry.
+  uint64_t read_ns;
   uint64_t dev_ns;  // the stamp in its own device's PHC time; 0 when the daemon's fit applies
   uint8_t cq_idx;
   uint8_t err;  // error completion: its timestamp field is not a clock reading
@@ -803,6 +806,7 @@ void capture(const unsigned char* e, int cq_idx, bool err, uint64_t now_ns, uint
   RawCqe r;
   std::memcpy(r.cqe, e, kCqeSize);
   r.cpu_ns = now_ns;
+  r.read_ns = mono_ns();
   r.dev_ns = dev_ns;
   r.cq_idx = static_cast<uint8_t>(cq_idx);
   r.err = err ? 1 : 0;
@@ -968,7 +972,7 @@ void emit_from_raw(const RawCqe& r) {
   // When the sweep found this entry, after the NIC wrote it, so it bounds the CPU clock from the
   // NIC side.
   const auto seen_on_axis = static_cast<unsigned long long>(
-      seen_ns != 0 ? s->clock().remap(seen_ns) / DATACRUMBS_TIME_DIVISOR_NS : 0);
+      r.read_ns != 0 ? s->clock().remap(r.read_ns) / DATACRUMBS_TIME_DIVISOR_NS : 0);
   const auto absent_on_axis = static_cast<unsigned long long>(
       joined && req.absent_ns != 0 ? s->clock().remap(req.absent_ns) / DATACRUMBS_TIME_DIVISOR_NS
                                    : 0);
